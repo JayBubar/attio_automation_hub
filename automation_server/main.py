@@ -12,8 +12,8 @@ Run on Railway: uvicorn main:app --host 0.0.0.0 --port $PORT
 
 from fastapi import FastAPI
 
-from smartlead_routes import router as smartlead_router
-from activecampaign_routes import router as activecampaign_router
+from .smartlead_routes import router as smartlead_router
+from .activecampaign_routes import router as activecampaign_router
 
 app = FastAPI(title="Attio Automation Hub")
 
