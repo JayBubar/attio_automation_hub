@@ -24,6 +24,14 @@ Edna Stone's contacts are being redistributed to Jay (per your migration
 notes), so running this with --rep jay also pulls anything still owned by
 "Edna Stone".
 
+Segment selection reads a bounded window, not the whole pool. The Never
+Contacted pool is 648-11,237 people per owner and each candidate considered
+costs one Attio company read, so only the first ENRICH_POOL_SIZE (400)
+not-yet-batched candidates are enriched and bucketed. The batch is sliced
+from the largest (vertical, size) bucket in that window. Raise
+ENRICH_POOL_SIZE for a wider search at the cost of a slower run; the window
+advances naturally as contacts get checkpointed.
+
 Usage:
   py scripts/outreach.py --rep kurt --dry-run
   py scripts/outreach.py --rep kurt

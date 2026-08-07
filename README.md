@@ -64,7 +64,7 @@ serving if that variable is unset -- an empty token must never be a valid one.
 
 | Route | What it does |
 | --- | --- |
-| `POST /trigger/outreach-batch?rep=&batch_size=&dry_run=` | Runs `scripts/outreach.py`. Blocks until done (~20-30s per contact), 600s cap. |
+| `POST /trigger/outreach-batch?rep=&batch_size=&dry_run=` | Runs `scripts/outreach.py`. Blocks until done, 600s cap. Dry-run ~25s; a real run adds ~20-30s per contact for the Claude call and Attio task creates. |
 | `GET /tasks/{rep}` | Open Attio tasks for that rep, left-joined to `outreach_email_drafts` on `task_id`. |
 | `PATCH /tasks/{task_id}/complete` | Marks the Attio task completed. |
 | `POST /tasks/{task_id}/draft-email?rep=` | Creates an Outlook draft in the rep's own mailbox. |
