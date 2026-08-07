@@ -202,18 +202,25 @@ def get_rep_tasks(rep: str, authorization: str | None = Header(None)):
         finally:
             con.close()
 
+    def company_from_content(content: str):
+        """Cadence tasks are titled "Email 1/3 · {company}: {contact}".
+        Anything else is a hand-written task with no company to parse --
+        return None rather than echoing the whole title back as a company."""
+        if "·" not in content:
+            return None
+        return content.split("·", 1)[1].split(":", 1)[0].strip() or None
+
     out = []
     for t in mine:
         task_id = t["id"]["task_id"]
         linked = t.get("linked_records") or []
         d = drafts.get(task_id)
+        content = t.get("content_plaintext") or t.get("content") or ""
         out.append({
             "task_id": task_id,
-            "content": t.get("content_plaintext") or t.get("content") or "",
+            "content": content,
             "deadline_at": t.get("deadline_at"),
-            # The task content already carries "Company: Name"; the linked
-            # record id is what the UI needs to deep-link back into Attio.
-            "company_name": (t.get("content_plaintext") or "").split("·")[-1].strip(),
+            "company_name": company_from_content(content),
             "linked_record_id": linked[0].get("target_record_id") if linked else None,
             "draft": (
                 {"subject": d["subject"], "body": d["body"],

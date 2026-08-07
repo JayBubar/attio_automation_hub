@@ -67,6 +67,8 @@ import os
 import json
 import time
 import argparse
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 
 import duckdb
@@ -74,6 +76,16 @@ import requests
 
 ATTIO_API_BASE = "https://api.attio.com/v2"
 MOTHERDUCK_DB = "hubspot_email_archive"
+
+# How many not-yet-batched candidates to enrich before bucketing by segment.
+# The pool this selects from is five figures per owner; enriching all of them
+# costs one Attio company read each and is what the batch is actually sliced
+# from, so it is capped. Raise it for a wider segment search at the cost of a
+# slower run.
+ENRICH_POOL_SIZE = 400
+COMPANY_LOOKUP_WORKERS = 8
+
+_thread_local = threading.local()
 
 REPS = {
     "kurt": {"member_id": "928e9d43-504b-4e51-8db2-54c4c40d0ecf", "name": "Kurt Haas",
@@ -150,9 +162,16 @@ def select_value(values, slug):
     return entry.get("value")
 
 
-def fetch_candidates(session, rep):
+def fetch_candidates(session, rep, already_seen, pool_size=ENRICH_POOL_SIZE):
     """Query People: prospect_path = Never Contacted, owned by this rep
-    (or Edna Stone for Jay), excluding unsubscribed. Attio caps at 500/page."""
+    (or Edna Stone for Jay), excluding unsubscribed. Attio caps at 500/page.
+
+    Stops paging as soon as pool_size not-yet-batched candidates are in hand.
+    The Never Contacted pool runs to five figures per owner, and every
+    candidate we keep costs a company lookup later -- pulling all of them to
+    then slice off 25 meant the run took the same time whether batch_size was
+    2 or 25, and blew past the Railway edge timeout either way.
+    """
     owner_or = [{"contact_owner": {"$eq": name}} for name in rep["owner_names"]]
     filter_body = {
         "$and": [
@@ -161,7 +180,8 @@ def fetch_candidates(session, rep):
             {"$not": {"ac_prospect_suppression": {"$eq": "Unsubscribed"}}},
         ]
     }
-    candidates = []
+    unseen = []
+    scanned = 0
     offset = 0
     limit = 500
     while True:
@@ -171,11 +191,12 @@ def fetch_candidates(session, rep):
         )
         resp.raise_for_status()
         page = resp.json().get("data", [])
-        candidates.extend(page)
-        if len(page) < limit:
+        scanned += len(page)
+        unseen.extend(r for r in page if r["id"]["record_id"] not in already_seen)
+        if len(unseen) >= pool_size or len(page) < limit:
             break
         offset += limit
-    return candidates
+    return unseen[:pool_size], scanned
 
 
 def extract_ref_ids(ref_value):
@@ -187,11 +208,15 @@ def extract_ref_ids(ref_value):
     return object_id, record_id
 
 
-def fetch_company_segment(session, cache, company_object_id, company_record_id):
-    """Returns (vertical_market, employee_range, company_name), cached by
-    record_id since many contacts share a company."""
-    if company_record_id in cache:
-        return cache[company_record_id]
+def fetch_company_segment(company_object_id, company_record_id):
+    """Returns (vertical_market, employee_range, company_name) for one company.
+
+    Uses a thread-local Session: requests.Session is not thread-safe, and
+    these run concurrently.
+    """
+    session = getattr(_thread_local, "session", None)
+    if session is None:
+        session = _thread_local.session = attio_session()
     try:
         resp = session.get(f"{ATTIO_API_BASE}/objects/{company_object_id}/records/{company_record_id}")
         resp.raise_for_status()
@@ -200,22 +225,38 @@ def fetch_company_segment(session, cache, company_object_id, company_record_id):
         size = select_value(values, "employee_range")
         name_val = values.get("name")
         name = name_val[0]["value"] if name_val else "(unknown company)"
+        return vertical, size, name
     except Exception as e:
         print(f"    [company lookup failed for object_id={company_object_id} record_id={company_record_id}: {e}]")
-        vertical, size, name = None, None, "(unknown company)"
-    cache[company_record_id] = (vertical, size, name)
-    return cache[company_record_id]
+        return None, None, "(unknown company)"
+
+
+def fetch_company_segments(refs):
+    """refs: set of (company_object_id, company_record_id). Returns a dict
+    keyed by company_record_id. Fetched concurrently -- these are the bulk of
+    the wall time and Attio has no batch-read endpoint for them."""
+    out = {}
+    if not refs:
+        return out
+    with ThreadPoolExecutor(max_workers=COMPANY_LOOKUP_WORKERS) as pool:
+        futures = {
+            pool.submit(fetch_company_segment, obj_id, rec_id): rec_id
+            for obj_id, rec_id in refs
+        }
+        for fut in as_completed(futures):
+            out[futures[fut]] = fut.result()
+    return out
 
 
 def build_batch(session, rep, batch_size, already_seen):
-    raw = fetch_candidates(session, rep)
-    company_cache = {}
-    enriched = []
+    raw, scanned = fetch_candidates(session, rep, already_seen)
+    print(f"Scanned {scanned} Never Contacted records, {len(raw)} not yet batched "
+          f"(capped at {ENRICH_POOL_SIZE} for segmentation).")
 
+    # First pass: parse the person payloads we already have. No HTTP here.
+    parsed = []
+    company_refs = set()
     for r in raw:
-        record_id = r["id"]["record_id"]
-        if record_id in already_seen:
-            continue
         values = r.get("values", {})
         name_val = values.get("name")
         name = name_val[0].get("full_name") if name_val else "(unknown)"
@@ -232,11 +273,26 @@ def build_batch(session, rep, batch_size, already_seen):
         if not company_object_id or not company_record_id:
             print(f"    [could not parse company reference for {name}: {company_ref}]")
             continue
-        vertical, size, company_name = fetch_company_segment(session, company_cache, company_object_id, company_record_id)
-
-        enriched.append({
-            "record_id": record_id, "name": name, "email": email,
+        company_refs.add((company_object_id, company_record_id))
+        parsed.append({
+            "record_id": r["id"]["record_id"], "name": name, "email": email,
             "job_title": job_title, "persona": persona,
+            "company_record_id": company_record_id,
+        })
+
+    # Second pass: one concurrent round of company lookups for the distinct
+    # companies only -- many contacts share one.
+    print(f"Looking up {len(company_refs)} distinct companies...")
+    segments = fetch_company_segments(company_refs)
+
+    enriched = []
+    for c in parsed:
+        vertical, size, company_name = segments.get(
+            c["company_record_id"], (None, None, "(unknown company)")
+        )
+        enriched.append({
+            "record_id": c["record_id"], "name": c["name"], "email": c["email"],
+            "job_title": c["job_title"], "persona": c["persona"],
             "company_name": company_name, "vertical": vertical, "size": size,
         })
 
