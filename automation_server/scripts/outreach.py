@@ -72,15 +72,26 @@ Checkpoint table: hubspot_email_archive.main.outreach_batch_checkpoint
 """
 
 import os
+import sys
 import json
 import time
 import argparse
 import threading
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-import duckdb
-import requests
+# Resolve A records only, before any HTTP client exists. This service has no
+# IPv6 egress but api.anthropic.com is dual-stack, and the Anthropic SDK does
+# not fall back to IPv4 the way requests does -- without this, every Claude
+# call dies as a bare "Connection error.". Lives one directory up because the
+# FastAPI process needs the same patch; see automation_server/ipv4_only.py.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import ipv4_only  # noqa: E402,F401
+
+import duckdb  # noqa: E402
+import requests  # noqa: E402
 
 ATTIO_API_BASE = "https://api.attio.com/v2"
 MOTHERDUCK_DB = "hubspot_email_archive"
@@ -509,8 +520,21 @@ def main():
             ])
             completed += 1
         except Exception as e:
-            print(f"  FAILED: {e}")
-            failed.append(f"{contact['name']} @ {contact['company_name']}: {e}")
+            # "Connection error." on its own is undiagnosable -- it cost a
+            # trawl through Railway's DNS logs to find it was IPv6 egress.
+            # Always name the exception type and its underlying cause, and
+            # dump one full traceback per run: enough to diagnose from the
+            # trigger response alone, without flooding stdout_tail when a
+            # whole batch of 25 fails the same way.
+            detail = f"{type(e).__name__}: {e}"
+            cause = e.__cause__ or e.__context__
+            if cause is not None:
+                detail += f"  <- {type(cause).__name__}: {cause}"
+            print(f"  FAILED: {detail}")
+            if not failed:
+                print("  --- full traceback (first failure only) ---")
+                print(traceback.format_exc())
+            failed.append(f"{contact['name']} @ {contact['company_name']}: {detail}")
 
     con.close()
     print(f"\nDone. {completed}/{len(batch)} contacts moved into outreach for {rep['name']}.")

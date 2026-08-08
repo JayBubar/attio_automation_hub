@@ -10,6 +10,8 @@ Run locally:    uvicorn main:app --reload --port 8000
 Run on Railway: uvicorn main:app --host 0.0.0.0 --port $PORT
 """
 
+import ipv4_only  # noqa: F401  -- must be first; see module docstring
+
 from fastapi import FastAPI
 
 from smartlead_routes import router as smartlead_router
