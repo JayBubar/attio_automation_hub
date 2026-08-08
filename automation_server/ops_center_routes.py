@@ -17,6 +17,7 @@ Requires, on top of what the webhook routes already need:
 """
 
 import os
+import re
 import secrets
 import socket
 import subprocess
@@ -24,6 +25,7 @@ import sys
 from pathlib import Path
 
 import duckdb
+import ipv4_only
 import requests
 from fastapi import APIRouter, Header, HTTPException
 
@@ -81,6 +83,21 @@ def md_connection():
     return duckdb.connect(f"md:{MOTHERDUCK_DB}?motherduck_token={os.environ['MOTHERDUCK_TOKEN']}")
 
 
+_SECRET_PATTERNS = re.compile(
+    r"(sk-ant-[\w\-]+|md_[\w\-]{16,}|Bearer\s+[\w\-\.=]+)", re.IGNORECASE
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Scrub credentials out of anything echoed back over HTTP.
+
+    A malformed API key produces an exception whose message quotes the key
+    verbatim -- so the error path is exactly where a secret escapes, and
+    "it's behind auth" is not a good enough reason to let it.
+    """
+    return _SECRET_PATTERNS.sub("[REDACTED]", text or "")
+
+
 def rows_to_dicts(cursor):
     cols = [d[0] for d in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
@@ -135,7 +152,9 @@ def trigger_outreach_batch(
                 "completed before the timeout are checkpointed and will not be "
                 "re-selected. Re-run to continue with the remainder."
             ),
-            "stdout_tail": stdout[-3000:],
+            # The script prints tracebacks on failure and those can quote a
+            # malformed credential verbatim -- scrub before returning.
+            "stdout_tail": redact_secrets(stdout[-3000:]),
         }
 
     return {
@@ -143,8 +162,8 @@ def trigger_outreach_batch(
         "timed_out": False,
         "rep": rep,
         "dry_run": dry_run,
-        "stdout_tail": result.stdout[-3000:],
-        "stderr_tail": result.stderr[-2000:] if result.returncode != 0 else None,
+        "stdout_tail": redact_secrets(result.stdout[-3000:]),
+        "stderr_tail": redact_secrets(result.stderr[-2000:]) if result.returncode != 0 else None,
     }
 
 
@@ -381,17 +400,31 @@ def status_anthropic(authorization: str | None = Header(None)):
     """
     _check_auth(authorization)
 
+    # ipv4_only replaced socket.getaddrinfo, so asking it for AF_INET6 would
+    # just hand back the A record and make this probe lie. Ask the real
+    # resolver what DNS actually publishes.
+    real_getaddrinfo = getattr(ipv4_only, "_original_getaddrinfo", socket.getaddrinfo)
     resolved = {}
     for fam, label in ((socket.AF_INET, "A"), (socket.AF_INET6, "AAAA")):
         try:
-            resolved[label] = socket.getaddrinfo("api.anthropic.com", 443, fam)[0][4][0]
+            resolved[label] = real_getaddrinfo("api.anthropic.com", 443, fam)[0][4][0]
         except OSError:
             resolved[label] = None
 
+    raw_key = os.environ.get("ANTHROPIC_API_KEY", "")
     result = {
-        "api_key_present": bool(os.environ.get("ANTHROPIC_API_KEY")),
-        "resolves_to": resolved,
-        "ipv6_suppressed": resolved["AAAA"] is None,
+        "api_key_present": bool(raw_key),
+        # Not the key itself. A key that fails to send is usually a key that
+        # was pasted with quotes, an inline comment, or a stray newline, and
+        # none of that is visible from "present: true".
+        "api_key_looks_clean": bool(
+            raw_key and raw_key == raw_key.strip()
+            and raw_key.startswith("sk-ant-")
+            and not any(c in raw_key for c in " '\"#\n\r\t")
+        ),
+        "api_key_length": len(raw_key),
+        "dns_publishes": resolved,
+        "ipv6_egress_suppressed_in_process": True,
     }
     if not result["api_key_present"]:
         result.update(ok=False, detail="ANTHROPIC_API_KEY is not set on this service")
@@ -411,8 +444,8 @@ def status_anthropic(authorization: str | None = Header(None)):
         result.update(
             ok=False,
             error_type=type(e).__name__,
-            detail=str(e),
-            caused_by=f"{type(cause).__name__}: {cause}" if cause is not None else None,
+            detail=redact_secrets(str(e)),
+            caused_by=redact_secrets(f"{type(cause).__name__}: {cause}") if cause is not None else None,
         )
     return result
 
