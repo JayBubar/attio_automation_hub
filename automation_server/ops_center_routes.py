@@ -18,6 +18,7 @@ Requires, on top of what the webhook routes already need:
 
 import os
 import secrets
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -366,6 +367,54 @@ def status_smartlead(authorization: str | None = Header(None)):
         con.close()
 
     return out
+
+
+@router.get("/status/anthropic")
+def status_anthropic(authorization: str | None = Header(None)):
+    """Can this container actually reach the Claude API?
+
+    Exists because a batch failing at the drafting step reports a bare
+    "Connection error." from deep inside the SDK, and a --dry-run never
+    calls Claude at all -- so there was no way to answer this question
+    short of burning a real batch or reading Railway's DNS logs. Sends a
+    16-token request; safe to hit any time.
+    """
+    _check_auth(authorization)
+
+    resolved = {}
+    for fam, label in ((socket.AF_INET, "A"), (socket.AF_INET6, "AAAA")):
+        try:
+            resolved[label] = socket.getaddrinfo("api.anthropic.com", 443, fam)[0][4][0]
+        except OSError:
+            resolved[label] = None
+
+    result = {
+        "api_key_present": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "resolves_to": resolved,
+        "ipv6_suppressed": resolved["AAAA"] is None,
+    }
+    if not result["api_key_present"]:
+        result.update(ok=False, detail="ANTHROPIC_API_KEY is not set on this service")
+        return result
+
+    try:
+        import anthropic
+        client = anthropic.Anthropic()
+        resp = client.messages.create(
+            model="claude-sonnet-5", max_tokens=16,
+            messages=[{"role": "user", "content": "Reply with exactly: PONG"}],
+        )
+        result.update(ok=True, model="claude-sonnet-5",
+                      reply="".join(b.text for b in resp.content if getattr(b, "type", None) == "text").strip())
+    except Exception as e:
+        cause = e.__cause__ or e.__context__
+        result.update(
+            ok=False,
+            error_type=type(e).__name__,
+            detail=str(e),
+            caused_by=f"{type(cause).__name__}: {cause}" if cause is not None else None,
+        )
+    return result
 
 
 @router.get("/status/snitcher-review")
