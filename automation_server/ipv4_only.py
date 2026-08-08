@@ -6,8 +6,21 @@ HTTP client is constructed:
 
     import ipv4_only  # noqa: F401  -- must precede anthropic/requests clients
 
-Why
----
+This did NOT fix the "Connection error." batch failures
+-------------------------------------------------------
+It was added believing it would. The actual cause was a malformed
+ANTHROPIC_API_KEY -- pasted into Railway with wrapping quotes and a trailing
+`# <-- NEW` comment -- which made httpx raise LocalProtocolError on an
+illegal header value. The SDK wraps that as APIConnectionError("Connection
+error."), which reads exactly like a network fault but never touches the
+network. See GET /status/anthropic, which surfaces the real cause.
+
+This module is kept because it is independently correct, not because it
+fixed that bug. If you want it gone, deleting it and dropping the two
+imports is safe.
+
+Why keep it
+-----------
 This Railway service runs with `ipv6EgressEnabled: false`, so the container
 has no outbound route for IPv6. Most of the hosts this codebase talks to are
 dual-stack and DNS happily hands back a AAAA record:
@@ -19,17 +32,13 @@ dual-stack and DNS happily hands back a AAAA record:
     server.smartlead.ai        A 104.20.37.149      AAAA 2606:4700:10::6814:2595
     api.motherduck.com         A 98.88.88.236       (IPv4 only)
 
-Attio calls kept working while Claude calls failed with a bare
-"Connection error.", which looks like it is about the host but is not:
 requests/urllib3 iterates over every getaddrinfo result and falls back to
-the A record when the AAAA connect fails, and the Anthropic SDK's httpx
-stack did not. So the same misconfiguration was hitting every dual-stack
-host; only one library surfaced it.
-
-Relying on one library's fallback is fragile, and even where it works it
-costs a doomed IPv6 connect attempt per request. Resolving A-only removes
-both problems, and costs nothing here because IPv6 egress is off anyway --
-there is no IPv6-only host we could reach even in principle.
+the A record when the AAAA connect fails, so those calls survive. That
+fallback is a library behaviour, not a guarantee -- and even where it works
+it costs a doomed IPv6 connect attempt per request. Resolving A-only removes
+both the fragility and the wasted attempt, and costs nothing here because
+IPv6 egress is off anyway: there is no IPv6-only host we could reach even in
+principle.
 
 The alternative is flipping `ipv6EgressEnabled: true` on the Railway
 service. That is one toggle rather than code, but it widens egress for the
