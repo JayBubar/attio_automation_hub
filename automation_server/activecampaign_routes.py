@@ -40,6 +40,7 @@ def attio_find_person_by_email(email):
         f"{ATTIO_BASE}/objects/people/records/query",
         headers=attio_headers(),
         json={"filter": {"email_addresses": {"email_address": {"$eq": email}}}, "limit": 1},
+        timeout=30,
     )
     resp.raise_for_status()
     data = resp.json().get("data", [])

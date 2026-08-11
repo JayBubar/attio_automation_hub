@@ -16,6 +16,7 @@ automation_server/             <- Railway Root Directory points HERE
   main.py                      FastAPI app, wires up all routers
   smartlead_routes.py          /webhooks/smartlead
   activecampaign_routes.py     /webhooks/activecampaign
+  form_fill_routes.py          /webhooks/ac-form-fill
   ops_center_routes.py         /trigger/*, /status/*, /tasks/* for the Ops Center
   graph_mail.py                /auth/microsoft/*, Outlook draft creation
   requirements.txt
@@ -54,6 +55,75 @@ tab first -- the app won't start without `ATTIO_API_KEY`.
 3. Add any new env vars to `.env.example`.
 4. Document the route's trigger/endpoint in the team's Webhooks & API Calls
    tracker tab.
+
+## AC form fills → Attio (`/webhooks/ac-form-fill`)
+
+One-way, AC → Attio, and that's the whole pipeline. A contact fills one of
+the five tracked forms, the automation's Webhook action POSTs here, and this
+route logs the event and appends the matching option to that person's **Form
+Filled** multiselect in Attio (`form_filled`). No workflow or sequence fires
+from it, nothing is written back to AC, and there is no reverse sync — so
+there is no loop-prevention logic here, unlike the tag/list route next door.
+
+Filled-form contacts keep receiving AC's existing marketing email exactly as
+they do now. This only makes that history visible on the Attio side.
+
+**The form name comes from the URL.** AC's Webhook action has no "which form
+was this" field, so each of the five automations points at its own URL:
+
+```
+https://<hub>/webhooks/ac-form-fill?form=Free%20Trial%20Sign%20Up&token=$AC_WEBHOOK_TOKEN
+```
+
+**The automation name is not the Attio option title.** The Attio field
+predates this pipeline and its options are named for the offer, not for the
+automation that fires — three of the five pairs share no words. `TRACKED_FORMS`
+in `form_fill_routes.py` is the entire translation layer:
+
+| `?form=` (AC automation) | Attio option written |
+| --- | --- |
+| Free Trial Sign Up | `Free Trial` |
+| Newsletter Signup | `Newsletter` |
+| Get the Guide | `Get the Guide` |
+| Send Us a Message | `Contact Us` |
+| RX Send Us a Message | `RX Contact Us` |
+
+Both columns are exact strings — Attio resolves select options by title and
+400s on anything that doesn't match one. Either column is accepted in
+`?form=`, so a URL built from the Attio label instead of the automation name
+still resolves.
+
+`Form Filled` also carries **ROI Calculator** and **Request a Demo**, which
+belong to other pipelines (ROI Calculator flows through the separate
+Lovable/Supabase path). This route never writes them and never clears them —
+PATCH only adds, so options it doesn't send are untouched. Posting either
+name here is treated as an unrecognized form: logged, no Attio write.
+
+An unrecognized form name is still logged, so a typo in a webhook URL is
+visible rather than silent. Same for a contact with no matching Attio person
+— the row lands, `attio_updated` comes back false, and that row *is* the
+"not in the CRM yet" signal.
+
+**Manual prerequisites, neither creatable over an API:**
+
+1. Attio: the `Form Filled` options **Get the Guide** and **RX Contact Us**
+   are still being added by hand. Until they exist, a fill on either of those
+   two forms logs its row and returns `attio_error` ("Cannot find select
+   option…"). The other three work today.
+2. ActiveCampaign: contact custom field **Form Filled** — AC-side bookkeeping,
+   not read by this route
+
+**MotherDuck:** writes to `hubspot_email_archive.main.contact_activity_log`
+(`source`, `event_type`, `contact_email`, `timestamp`, `details`). The route
+creates the table if it's missing. `details` is a JSON text blob rather than
+typed columns on purpose — Social and Conference follow-ups are meant to
+land in this same table under a different `source`, carrying whatever they
+need in there instead of a migration.
+
+**`AC_WEBHOOK_TOKEN`** is optional. Unset, the route serves unauthenticated,
+matching `/webhooks/activecampaign`. Set it and append `&token=` to all five
+URLs — this endpoint writes to MotherDuck and mutates Attio on every call,
+so it's worth having.
 
 ## Ops Center routes
 

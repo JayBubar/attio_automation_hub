@@ -2,9 +2,10 @@
 smartlead_routes.py
 
 Smartlead webhook route for the nonprofit-crm automation server. Handles
-EMAIL_SENT, SEQUENCE_COMPLETED, EMAIL_REPLIED, EMAIL_BOUNCED, and
-LEAD_UNSUBSCRIBED events and keeps the matching Attio People record's touch
-count, Prospect Path, and Cold Outreach Contact flag in sync.
+EMAIL_SENT, SEQUENCE_COMPLETED, EMAIL_REPLIED, EMAIL_BOUNCED,
+LEAD_UNSUBSCRIBED, and LEAD_CATEGORY_UPDATED events and keeps the matching
+Attio People record's touch count, Prospect Path, and Cold Outreach Contact
+flag in sync.
 
 Registered in main.py via app.include_router(smartlead_router).
 
@@ -13,8 +14,18 @@ Railway variables on this service -- see README.md.
 
 Smartlead side: Campaign > Settings > Webhooks > add
   https://<this-service's-railway-domain>/webhooks/smartlead
-subscribed to EMAIL_SENT, SEQUENCE_COMPLETED, EMAIL_REPLIED, EMAIL_BOUNCED,
-LEAD_UNSUBSCRIBED.
+Two webhook entries land on this same route/URL:
+  1. EMAIL_SENT, SEQUENCE_COMPLETED, EMAIL_REPLIED, EMAIL_BOUNCED,
+     LEAD_UNSUBSCRIBED (the original wiring)
+  2. LEAD_CATEGORY_UPDATED (added for the AI reply-categorization feature --
+     see the category sets below for the category -> Path mapping and the
+     reasoning per category)
+
+LEAD_CATEGORY_UPDATED payload shape (per Smartlead's webhook reference):
+  top-level "category" (string, e.g. "Interested") plus a redundant
+  lead_data.category.name. This code reads the top-level field and falls
+  back to the nested one so a Smartlead payload-format change doesn't
+  silently break category routing.
 """
 
 import os
@@ -28,6 +39,29 @@ router = APIRouter()
 ATTIO_API_KEY = os.environ["ATTIO_API_KEY"]
 ATTIO_BASE = "https://api.attio.com/v2"
 SMARTLEAD_WEBHOOK_SECRET = os.environ.get("SMARTLEAD_WEBHOOK_SECRET")  # optional
+
+# ---------------------------------------------------------------------------
+# LEAD_CATEGORY_UPDATED routing
+#
+# These are the 9 "Active AI Categories" configured in Smartlead as of
+# 2026-08-10. Deliberately conservative: only "Interested" / "Meeting
+# Request" / "Information Request" (clear positive signal) and "Not
+# Interested" / "Do Not Contact" (clear negative signal) move Prospect Path
+# automatically. "Wrong Person" and "Uncategorizable by Ai" are data-quality
+# problems, not funnel signals -- they get flagged via exclude_reason for a
+# human to look at rather than silently moving Path in either direction (the
+# Review Queue list this should really feed doesn't exist in Attio yet --
+# see Contact/Company Review List Workflow in the tracker). "Out Of Office"
+# is a transient auto-reply, not a lead signal -- no-op. "Sender Originated
+# Bounce" indicates a problem with our sending infra, not the lead, so it's
+# logged for visibility rather than acted on against the lead's record.
+# ---------------------------------------------------------------------------
+
+ENGAGED_CATEGORIES = {"Interested", "Meeting Request", "Information Request"}
+NOT_INTERESTED_CATEGORIES = {"Not Interested"}
+DO_NOT_CONTACT_CATEGORIES = {"Do Not Contact"}
+REVIEW_FLAG_CATEGORIES = {"Wrong Person", "Uncategorizable by Ai"}
+NO_OP_CATEGORIES = {"Out Of Office", "Sender Originated Bounce"}
 
 
 def attio_headers():
@@ -56,6 +90,25 @@ def increment_touch_count(record_id, field_name):
     attio_patch_person(record_id, {field_name: [{"value": count + 1}]})
 
 
+def extract_record_id(payload):
+    """attio_record_id can show up in a few different places depending on
+    event type -- EMAIL_SENT/REPLY-style events nest it under "lead", while
+    LEAD_CATEGORY_UPDATED nests it under "lead_data". Check all of them."""
+    for container_key in ("lead", "lead_data"):
+        custom_fields = payload.get(container_key, {}).get("custom_fields", {})
+        if custom_fields.get("attio_record_id"):
+            return custom_fields["attio_record_id"]
+    return payload.get("custom_fields", {}).get("attio_record_id")
+
+
+def extract_category(payload):
+    """Top-level "category" is the documented field; lead_data.category.name
+    is a redundant nested copy. Prefer top-level, fall back to nested."""
+    if payload.get("category"):
+        return payload["category"]
+    return (payload.get("lead_data", {}).get("category") or {}).get("name")
+
+
 @router.post("/webhooks/smartlead")
 async def smartlead_webhook(request: Request):
     if SMARTLEAD_WEBHOOK_SECRET:
@@ -65,8 +118,7 @@ async def smartlead_webhook(request: Request):
 
     payload = await request.json()
     event_type = payload.get("event_type")
-    custom_fields = payload.get("lead", {}).get("custom_fields", {}) or payload.get("custom_fields", {})
-    record_id = custom_fields.get("attio_record_id")
+    record_id = extract_record_id(payload)
 
     if not record_id:
         print(f"Smartlead webhook with no attio_record_id: {event_type}")
@@ -105,6 +157,49 @@ async def smartlead_webhook(request: Request):
             "prospect_path": [{"value": "Not Interested"}],
             "last_path_change_date": [{"value": today}],
         })
+
+    elif event_type == "LEAD_CATEGORY_UPDATED":
+        category = extract_category(payload)
+
+        if category in ENGAGED_CATEGORIES:
+            attio_patch_person(record_id, {
+                "prospect_path": [{"value": "Engaged"}],
+                "cold_outreach_contact": [{"value": False}],
+                "last_path_change_date": [{"value": today}],
+            })
+
+        elif category in NOT_INTERESTED_CATEGORIES:
+            attio_patch_person(record_id, {
+                "prospect_path": [{"value": "Not Interested"}],
+                "cold_outreach_contact": [{"value": False}],
+                "last_path_change_date": [{"value": today}],
+            })
+
+        elif category in DO_NOT_CONTACT_CATEGORIES:
+            attio_patch_person(record_id, {
+                "prospect_path": [{"value": "Not Interested"}],
+                "cold_outreach_contact": [{"value": False}],
+                "do_not_migrate": [{"value": True}],
+                "exclude_reason": [{"value": "Smartlead: Do Not Contact"}],
+                "last_path_change_date": [{"value": today}],
+            })
+
+        elif category in REVIEW_FLAG_CATEGORIES:
+            # Doesn't move Path in either direction -- this is a
+            # data-quality problem (bad match / AI couldn't tell), not a
+            # funnel signal. Flags for a human via exclude_reason since the
+            # dedicated Review Queue list doesn't exist in Attio yet.
+            attio_patch_person(record_id, {
+                "exclude_reason": [{"value": f"Smartlead category: {category} -- needs review"}],
+            })
+
+        elif category in NO_OP_CATEGORIES:
+            print(f"Smartlead category '{category}' for record {record_id} -- no action (transient/infra, not a lead signal)")
+
+        else:
+            # New/renamed category in Smartlead that isn't in any bucket
+            # above -- don't guess, just log so it gets noticed and mapped.
+            print(f"Unmapped Smartlead category '{category}' for record {record_id}")
 
     else:
         print(f"Unhandled Smartlead event type: {event_type}")

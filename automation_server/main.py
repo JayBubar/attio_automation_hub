@@ -16,6 +16,7 @@ from fastapi import FastAPI
 
 from smartlead_routes import router as smartlead_router
 from activecampaign_routes import router as activecampaign_router
+from form_fill_routes import router as form_fill_router
 from ops_center_routes import router as ops_center_router
 from graph_mail import router as graph_mail_router
 
@@ -23,6 +24,7 @@ app = FastAPI(title="Attio Automation Hub")
 
 app.include_router(smartlead_router)
 app.include_router(activecampaign_router)
+app.include_router(form_fill_router)
 app.include_router(ops_center_router)
 app.include_router(graph_mail_router)
 
