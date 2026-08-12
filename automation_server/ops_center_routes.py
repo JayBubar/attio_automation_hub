@@ -43,6 +43,30 @@ TOGGLEABLE_FLAGS = {
         "env_var": "AC_PAUSED",
         "label": "ActiveCampaign rotation paused",
         "description": "When on, outreach_rotation.py does not push to or evict from AC.",
+        "live_warning": (
+            "AC rotation is live: the next run will push new contacts into "
+            "ActiveCampaign and evict stale ones. The standing decision is to "
+            "leave this paused."
+        ),
+    },
+    "smartlead_paused": {
+        # Defaults paused for the same reason as ac_paused, and one of its own:
+        # the Smartlead half of main() used to have no gate at all, so before
+        # this flag existed the only thing standing between a scheduled run and
+        # real email was DRY_RUN. Starting paused makes resuming a decision
+        # somebody makes on purpose rather than a default nobody chose.
+        "default": True,
+        "env_var": "SMARTLEAD_PAUSED",
+        "label": "Smartlead rotation paused",
+        "description": (
+            "When on, outreach_rotation.py does not top up the Smartlead pool "
+            "or drain the 'Add to Smartlead' intake queue."
+        ),
+        "live_warning": (
+            "Smartlead rotation is live: the next run will send real email. It "
+            "drains the hand-curated 'Add to Smartlead' queue first, so check "
+            "what's sitting on that list before resuming."
+        ),
     },
 }
 
@@ -598,6 +622,9 @@ def get_config_flags(authorization: str | None = Header(None)):
             "source": source,
             "label": meta["label"],
             "description": meta["description"],
+            # Shown by the Ops Center when the flag reads False. Lives here so
+            # adding a flag doesn't also mean editing the Streamlit page.
+            "live_warning": meta.get("live_warning"),
             "updated_at": (row or {}).get("updated_at"),
             "updated_by": (row or {}).get("updated_by"),
         })

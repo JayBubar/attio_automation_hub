@@ -133,7 +133,20 @@ takes effect on the next run without a redeploy.
 ```
 GET   /config/flags              current value + source (motherduck/env/default)
 PATCH /config/flags/ac_paused?value=false&updated_by=jay
+PATCH /config/flags/smartlead_paused?value=false&updated_by=jay
 ```
+
+**Both channels have their own pause.** `smartlead_paused` gates the Smartlead
+half of `main()`, which previously had no gate at all — `ac_paused` only ever
+guarded the AC half, so a scheduled run's one safeguard against real email was
+`DRY_RUN`. That mattered more once the "Add to Smartlead" intake queue was
+wired up, because a run now sends to people a human queued days earlier. While
+paused, the intake queue is left untouched rather than drained.
+
+Each flag carries its own `live_warning` text in `TOGGLEABLE_FLAGS`, returned
+by `GET /config/flags` and rendered by the Ops Center when the flag reads
+false. Keeping it on the hub means adding a flag can't accidentally ship an
+unwarned toggle in the Streamlit page.
 
 **The default is paused.** If the config lookup fails, the run skips AC rather
 than pushing — a missed day is recoverable, an unintended send to real people

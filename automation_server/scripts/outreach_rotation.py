@@ -131,6 +131,16 @@ DRY_RUN = os.environ.get("DRY_RUN", "true").lower() == "true"
 # behaviour between eviction and push.
 AC_PAUSED = automation_config.get_flag("ac_paused", default=True, env_var="AC_PAUSED")
 
+# Same treatment for Smartlead, which until now had no gate at all: the AC
+# pause guarded only the AC half of main(), so the Smartlead half ran on every
+# invocation and DRY_RUN was the single thing standing between a scheduled run
+# and real email. That gap got sharper once the "Add to Smartlead" intake queue
+# was wired up, since a run now sends to people a human queued days earlier.
+# Defaults paused, read once, for the same reason as AC.
+SMARTLEAD_PAUSED = automation_config.get_flag(
+    "smartlead_paused", default=True, env_var="SMARTLEAD_PAUSED"
+)
+
 # Smartlead no longer uses a day-based staleness guess. SEQUENCE_COMPLETED,
 # EMAIL_REPLIED, EMAIL_BOUNCED, and LEAD_UNSUBSCRIBED webhooks (handled in
 # ../smartlead_routes.py) flag contacts the instant the event happens, so this
@@ -724,6 +734,12 @@ def main():
 
     # --- Smartlead: event-driven eviction (see webhook handler), this
     # script only tops up the standing pool to keep inboxes fed. ---
+    if SMARTLEAD_PAUSED:
+        print("Smartlead push is paused (automation_config flag 'smartlead_paused') "
+              "-- skipping. The intake queue is not drained while paused.")
+        print("=== Run complete ===")
+        return
+
     settings = smartlead_campaign_settings()
     max_per_day = int(settings.get("max_leads_per_day", 0))
     if max_per_day == 0:
