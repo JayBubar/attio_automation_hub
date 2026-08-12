@@ -24,12 +24,27 @@ import subprocess
 import sys
 from pathlib import Path
 
+import automation_config
 import duckdb
 import ipv4_only
 import requests
+import webhook_log
 from fastapi import APIRouter, Header, HTTPException
 
 router = APIRouter()
+
+# Flags the Ops Center may toggle, and the default each resolves to when
+# neither MotherDuck nor the environment has an opinion. Allow-listed rather
+# than free-form: this endpoint writes config the daily jobs obey, so an
+# arbitrary key from the caller has no business creating a row.
+TOGGLEABLE_FLAGS = {
+    "ac_paused": {
+        "default": True,
+        "env_var": "AC_PAUSED",
+        "label": "ActiveCampaign rotation paused",
+        "description": "When on, outreach_rotation.py does not push to or evict from AC.",
+    },
+}
 
 OPS_CENTER_TOKEN = os.environ.get("OPS_CENTER_TOKEN", "")
 ATTIO_API_KEY = os.environ["ATTIO_API_KEY"]
@@ -39,6 +54,11 @@ MOTHERDUCK_DB = os.environ.get("MOTHERDUCK_DATABASE", "hubspot_email_archive")
 SMARTLEAD_API_KEY = os.environ.get("SMARTLEAD_API_KEY", "")
 SMARTLEAD_CAMPAIGN_ID = os.environ.get("SMARTLEAD_CAMPAIGN_ID", "")
 SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
+
+# The AC bridge's receiver, as mounted by activecampaign_routes.py. Kept here
+# as a constant so /status/ac-bridge checks the path that is actually served
+# rather than a second copy of the string that can drift out of sync.
+AC_WEBHOOK_PATH = "/webhooks/activecampaign"
 
 # Verified against the live workspace, not guessed.
 SNITCHER_REVIEW_LIST_ID = "6d4dce27-180c-42ed-b722-876f51e7c184"
@@ -487,6 +507,124 @@ def status_snitcher_review(authorization: str | None = Header(None)):
         "status_new": new_count,
         "total_entries": total,
     }
+
+
+@router.get("/status/ac-bridge")
+def status_ac_bridge(authorization: str | None = Header(None)):
+    """Real state of the AC <-> Attio tag sync.
+
+    Replaces the Ops Center's hardcoded "Down", which probed
+    peaceful-generosity-production-312b.up.railway.app -- a host that 404s and
+    that the bridge never ran on. The bridge is a route in *this* service, so
+    it was reporting Down while working fine.
+
+    Two independent facts, deliberately not collapsed into one green light:
+
+    `route_registered` -- is the receiver actually mounted? Answered by asking
+    this app's own router, not by an HTTP call to ourselves. A route dropped
+    from main.py shows up here as False while /health still says 200.
+
+    `events` -- has any traffic arrived, and when? This is the part a
+    reachability check cannot answer: a correctly mounted route with a
+    misconfigured AC automation pointed at it looks perfectly healthy.
+
+    Note what this deliberately does *not* claim. Quiet is not the same as
+    broken -- no events just means nobody's tag changed, which is the normal
+    state most days. The caller gets the timestamp and decides; this endpoint
+    does not invent an up/down verdict out of silence.
+    """
+    _check_auth(authorization)
+
+    # Local import: main.py imports this module, so this cannot happen at
+    # module scope. `main` is already in sys.modules by the time any request
+    # is served, so this is a dict lookup, not a re-import.
+    #
+    # Falls back to activecampaign_routes' own router if `main` isn't
+    # importable under some entrypoint. A slightly weaker answer beats a 500 --
+    # this endpoint exists to report status, so it has no business being the
+    # thing that breaks.
+    try:
+        from main import app as _app
+        routes, scope = _app.routes, "app"
+    except Exception as e:
+        import activecampaign_routes
+        routes, scope = activecampaign_routes.router.routes, f"router-only ({e})"
+
+    registered = any(
+        getattr(r, "path", None) == AC_WEBHOOK_PATH
+        and "POST" in (getattr(r, "methods", None) or set())
+        for r in routes
+    )
+
+    return {
+        "service": "attio-automation-hub",
+        "webhook_path": AC_WEBHOOK_PATH,
+        "route_registered": registered,
+        "checked_against": scope,
+        "expected_series_id": os.environ.get("ACTIVECAMPAIGN_SERIES_ID", "15"),
+        "events": webhook_log.recent_summary("activecampaign"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Automation flags
+# ---------------------------------------------------------------------------
+
+@router.get("/config/flags")
+def get_config_flags(authorization: str | None = Header(None)):
+    """Current value of every toggleable flag, plus where the value came from.
+
+    `source` matters operationally: a flag showing `default` means neither the
+    toggle nor the env var is set, which is also what a MotherDuck outage looks
+    like -- so the Ops Center can show that rather than implying the stored
+    value was read back successfully.
+    """
+    _check_auth(authorization)
+
+    stored = {r["key"]: r for r in automation_config.list_flags()}
+    out = []
+    for key, meta in TOGGLEABLE_FLAGS.items():
+        value = automation_config.get_flag(key, default=meta["default"], env_var=meta["env_var"])
+        row = stored.get(key)
+        if row is not None:
+            source = "motherduck"
+        elif os.environ.get(meta["env_var"]) is not None:
+            source = "env"
+        else:
+            source = "default"
+        out.append({
+            "key": key,
+            "value": value,
+            "source": source,
+            "label": meta["label"],
+            "description": meta["description"],
+            "updated_at": (row or {}).get("updated_at"),
+            "updated_by": (row or {}).get("updated_by"),
+        })
+    return out
+
+
+@router.patch("/config/flags/{key}")
+def set_config_flag(
+    key: str,
+    value: bool,
+    updated_by: str = "ops-center",
+    authorization: str | None = Header(None),
+):
+    """Toggle a flag. Takes effect on the next scheduled run -- no redeploy."""
+    _check_auth(authorization)
+    if key not in TOGGLEABLE_FLAGS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"unknown flag {key!r}; known flags: {sorted(TOGGLEABLE_FLAGS)}",
+        )
+    try:
+        automation_config.set_flag(key, value, updated_by=updated_by)
+    except Exception as e:
+        # set_flag raising means the value was not persisted. Surfacing 503
+        # keeps the Ops Center from rendering a toggle the jobs will not obey.
+        raise HTTPException(status_code=503, detail=redact_secrets(str(e)))
+    return {"key": key, "value": value, "updated_by": updated_by}
 
 
 @router.get("/status/allo-tag-registry")

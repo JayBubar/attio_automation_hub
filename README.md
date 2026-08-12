@@ -14,6 +14,7 @@ positive reply -> Attio as Lead is its own pipeline, not this repo).
 ```
 automation_server/             <- Railway Root Directory points HERE
   main.py                      FastAPI app, wires up all routers
+  automation_config.py         Runtime on/off flags (MotherDuck -> env -> default)
   smartlead_routes.py          /webhooks/smartlead
   activecampaign_routes.py     /webhooks/activecampaign
   form_fill_routes.py          /webhooks/ac-form-fill
@@ -55,6 +56,98 @@ tab first -- the app won't start without `ATTIO_API_KEY`.
 3. Add any new env vars to `.env.example`.
 4. Document the route's trigger/endpoint in the team's Webhooks & API Calls
    tracker tab.
+
+## AC tag ↔ Attio list sync (`/webhooks/activecampaign`)
+
+Keeps Attio's **Active Marketing Contact** flag, **Prospect Path**, and
+membership of the list **Current Marketing Prospects in ActiveCampaign**
+(`active_campaign_target_list`) in step with AC's **Attio Marketing Contact**
+tag (tag id 3).
+
+**Automation 15 is designed to carry both triggers** — tag added and tag
+removed — pointed at the same URL, so `seriesid` is 15 either way and cannot
+tell them apart. The route reads `contact[tags]` instead, which lists only
+currently-applied tags: marketing tag present means added, absent means
+removed. `seriesid` is still checked, as a gate — a payload from any other
+automation is logged and ignored rather than acted on.
+
+> ⚠️ **Open manual prerequisite (as of 2026-08-12): the Tag Removed trigger
+> does not exist yet.** `GET /api/3/automations/15` reports a single start:
+> `{"id":"24","series":"15","type":"tagadd"}`. There is no `tagremove`. The
+> receiver handles removals correctly, but AC never sends one — so removing
+> the tag in AC is silently a no-op and the contact stays
+> `active_marketing_contact=true` in Attio forever. Fix in AC's UI: automation
+> 15 → add a second trigger, **Tag Removed**, tag id 3, same webhook URL. This
+> cannot be done over the API; AC exposes no trigger-creation endpoint.
+
+A payload with **no `contact[tags]` key at all** is ignored, not treated as a
+removal. "Contact has no tags" and "tags field was never mapped on the webhook
+action" are indistinguishable otherwise, and guessing wrong un-flags people who
+are still in outreach. Every event returning `no_tags_field` means the field is
+not mapped in AC.
+
+**Lookup is by `contact[fields][attio_record_id]` first**, email second. The id
+survives a contact changing their email address; a stale id (record deleted or
+merged) falls back to email rather than failing.
+
+| AC state | Attio writes |
+| --- | --- |
+| tag present | `active_marketing_contact=true`, path `In Outreach`, date today, + list add |
+| tag absent | `active_marketing_contact=false`, path `Cold/Retry Pending`, date today |
+
+List *removal* stays with the Attio-native workflow (Active Marketing Contact =
+false → remove from list); only the add is done here.
+
+### Is the bridge alive? (`/status/ac-bridge`)
+
+Every inbound AC webhook is appended to `webhook_event_log` in MotherDuck
+(`webhook_log.py`) — **including the ignored ones**, which are the diagnostic:
+a run of `no_tags_field` means the tags field isn't mapped on the AC webhook
+action, and a run of `unexpected_seriesid` means another automation is pointed
+here. Log only successes and both look identical to silence.
+
+Logging is best-effort and never fails the webhook. A MotherDuck outage must
+not make the hub 500 back at AC, which would trigger AC's retry-then-disable
+behaviour and turn a reporting problem into a real outage.
+
+`GET /status/ac-bridge` returns two facts, deliberately not merged into one
+light:
+
+- `route_registered` — is the receiver mounted? Read from the app's own router,
+  so a route dropped from `main.py` shows False while `/health` still says 200.
+- `events` — last event, 7-day count, and a recent tail. A mounted route with a
+  mis-wired AC automation looks perfectly healthy without this.
+
+**Quiet is not broken.** No events just means nobody's tag changed. The
+endpoint reports the timestamp and lets the caller judge; it does not
+manufacture an up/down verdict out of silence. If the log can't be read it
+returns `available: false` with a reason, rather than reporting "no traffic".
+
+### Pausing and resuming the daily rotation
+
+`scripts/outreach_rotation.py` reads its AC pause state from
+`automation_config.py` at the start of each run: MotherDuck `automation_config`
+row → `AC_PAUSED` env var → default. MotherDuck wins so the Ops Center toggle
+takes effect on the next run without a redeploy.
+
+```
+GET   /config/flags              current value + source (motherduck/env/default)
+PATCH /config/flags/ac_paused?value=false&updated_by=jay
+```
+
+**The default is paused.** If the config lookup fails, the run skips AC rather
+than pushing — a missed day is recoverable, an unintended send to real people
+is not. `source: default` in the GET response is also what a MotherDuck outage
+looks like, so the Ops Center can show that instead of implying it read a
+stored value.
+
+### Manual prerequisite: `ac_contact_id`
+
+There is **no `ac_contact_id` attribute on People** in the workspace. Writing it
+400s the whole PATCH, taking the path and flag updates down with it, so the
+rotation script only writes it when `ATTIO_AC_CONTACT_ID_SLUG` is set — and it
+should stay empty until the attribute exists. Until then eviction looks the AC
+contact up by email instead, which costs one extra AC call per evicted contact.
 
 ## AC form fills → Attio (`/webhooks/ac-form-fill`)
 
@@ -138,9 +231,78 @@ serving if that variable is unset -- an empty token must never be a valid one.
 | `GET /tasks/{rep}` | Open Attio tasks for that rep, left-joined to `outreach_email_drafts` on `task_id`. |
 | `PATCH /tasks/{task_id}/complete` | Marks the Attio task completed. |
 | `POST /tasks/{task_id}/draft-email?rep=` | Creates an Outlook draft in the rep's own mailbox. |
-| `GET /status/smartlead` | Campaign state + `total_leads` + last rotation run. |
+| `GET /status/smartlead` | Campaign state + `total_leads` + last rotation run. Note `total_leads` is lifetime, not active — see below. |
+| `GET /status/ac-bridge` | AC↔Attio bridge: receiver mounted, last webhook event, recent tail. |
 | `GET /status/snitcher-review` | Snitcher Review entries at Status = New. |
 | `GET /status/allo-tag-registry` | `allo_tag_registry` from MotherDuck. |
+| `GET /config/flags` | Automation on/off flags with their resolved source. |
+| `PATCH /config/flags/{key}?value=` | Toggles a flag. 503 if it could not be persisted. |
+
+### `total_leads` is lifetime, not active
+
+Smartlead documents `total_leads` on `GET /campaigns/{id}/leads` as the count
+of leads **matching the filter criteria**, and the callers here send no status
+filter — so it spans every status the campaign holds: `STARTED`, `INPROGRESS`,
+`COMPLETED`, `PAUSED`, `STOPPED`.
+
+Nothing in this repo ever removes a lead from a Smartlead campaign.
+`smartlead_routes.py` handles `SEQUENCE_COMPLETED` / `EMAIL_REPLIED` /
+`EMAIL_BOUNCED` / `LEAD_UNSUBSCRIBED` by writing to **Attio only**. So
+`total_leads` is monotonic — it only ever goes up.
+
+`outreach_rotation.py` used to subtract it from the target pool as if it were
+the active count. That math inverts itself over time: once the campaign's
+lifetime total passes `max_leads_per_day × sequence length`, headroom pins to
+zero permanently and the campaign silently stops being topped up — precisely
+when the sending inboxes are emptiest. The script now sizes the pool from
+Attio instead (`active_cold_outreach_contact = true`), which is the one place
+"still in sequence" actually decays, and prints the lifetime total alongside it
+as a diagnostic. The two converging means the Smartlead webhooks have stopped
+clearing the flag.
+
+### Smartlead list membership: the checkbox, not a list
+
+The AC path adds people to an Attio list (`active_campaign_target_list`). The
+Smartlead path deliberately **does not**, even though a `Smartlead Target List`
+(`smartlead_target_list`) exists in the workspace.
+
+That list has no custom attributes — only Attio's built-in `entry_id`,
+`created_at`, `created_by` — so membership carried nothing that
+`active_cold_outreach_contact` doesn't already carry, and it sat at zero
+entries with nothing reading it. The checkbox is what the Smartlead webhook
+handlers clear and what sizes the pool, making it the one signal that actually
+decays; "when did this person enter outreach" is answered by the
+`outreach_rotation_log` checkpoint table. Two sources of truth for one fact is
+how they drift, so there is only one.
+
+The empty `Smartlead Target List` can be deleted in Attio's UI whenever
+convenient. Left in place it's harmless but misleading — it reads like a
+half-finished integration.
+
+### The "Add to Smartlead" intake queue
+
+`Add to Smartlead` (`add_to_smartlead`) is a **hand-curated queue**, and it is
+now wired up: `push_smartlead_batch` drains it ahead of the Never Contacted
+pool, because someone deliberately put a person there while the pool is just
+whoever sorts earliest. The entry is removed only after the lead is in
+Smartlead *and* the Attio flag is set — dropping it earlier would lose the
+request if the push failed, and the list is the only record that a human ever
+asked.
+
+It had been holding 90+ people added on 2026-07-29 that nothing read: the push
+only ever queried the Never Contacted pool, so a deliberate "put these in
+outreach" did nothing and looked exactly like a queue being worked.
+
+Three cases are not pushed:
+
+| Case | What happens |
+| --- | --- |
+| already `active_cold_outreach_contact` | entry dropped — the request is already fulfilled, and leaving it would strand it forever |
+| `do_not_migrate = true` | **left on the list** for a human |
+| no email address | **left on the list** for a human |
+
+The last two stay put on purpose. They're the cases someone needs to look at,
+and silently dropping them is how a request disappears with nobody noticing.
 
 ### Outlook drafts
 

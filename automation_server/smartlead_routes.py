@@ -131,7 +131,7 @@ async def smartlead_webhook(request: Request):
 
     elif event_type == "SEQUENCE_COMPLETED":
         attio_patch_person(record_id, {
-            "cold_outreach_contact": [{"value": False}],
+            "active_cold_outreach_contact": [{"value": False}],
             "prospect_path": [{"value": "Cold/Retry Pending"}],
             "last_path_change_date": [{"value": today}],
         })
@@ -139,13 +139,13 @@ async def smartlead_webhook(request: Request):
     elif event_type == "EMAIL_REPLIED":
         attio_patch_person(record_id, {
             "prospect_path": [{"value": "Engaged"}],
-            "cold_outreach_contact": [{"value": False}],
+            "active_cold_outreach_contact": [{"value": False}],
             "last_path_change_date": [{"value": today}],
         })
 
     elif event_type == "EMAIL_BOUNCED":
         attio_patch_person(record_id, {
-            "cold_outreach_contact": [{"value": False}],
+            "active_cold_outreach_contact": [{"value": False}],
             "do_not_migrate": [{"value": True}],
             "exclude_reason": [{"value": "Smartlead hard bounce"}],
             "last_path_change_date": [{"value": today}],
@@ -153,7 +153,7 @@ async def smartlead_webhook(request: Request):
 
     elif event_type == "LEAD_UNSUBSCRIBED":
         attio_patch_person(record_id, {
-            "cold_outreach_contact": [{"value": False}],
+            "active_cold_outreach_contact": [{"value": False}],
             "prospect_path": [{"value": "Not Interested"}],
             "last_path_change_date": [{"value": today}],
         })
@@ -164,21 +164,21 @@ async def smartlead_webhook(request: Request):
         if category in ENGAGED_CATEGORIES:
             attio_patch_person(record_id, {
                 "prospect_path": [{"value": "Engaged"}],
-                "cold_outreach_contact": [{"value": False}],
+                "active_cold_outreach_contact": [{"value": False}],
                 "last_path_change_date": [{"value": today}],
             })
 
         elif category in NOT_INTERESTED_CATEGORIES:
             attio_patch_person(record_id, {
                 "prospect_path": [{"value": "Not Interested"}],
-                "cold_outreach_contact": [{"value": False}],
+                "active_cold_outreach_contact": [{"value": False}],
                 "last_path_change_date": [{"value": today}],
             })
 
         elif category in DO_NOT_CONTACT_CATEGORIES:
             attio_patch_person(record_id, {
                 "prospect_path": [{"value": "Not Interested"}],
-                "cold_outreach_contact": [{"value": False}],
+                "active_cold_outreach_contact": [{"value": False}],
                 "do_not_migrate": [{"value": True}],
                 "exclude_reason": [{"value": "Smartlead: Do Not Contact"}],
                 "last_path_change_date": [{"value": today}],
