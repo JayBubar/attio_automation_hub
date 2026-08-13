@@ -246,6 +246,8 @@ serving if that variable is unset -- an empty token must never be a valid one.
 | `POST /tasks/{task_id}/draft-email?rep=` | Creates an Outlook draft in the rep's own mailbox. |
 | `GET /status/smartlead` | Campaign state + `total_leads` + last rotation run. Note `total_leads` is lifetime, not active — see below. |
 | `GET /status/ac-bridge` | AC↔Attio bridge: receiver mounted, last webhook event, recent tail. |
+| `GET /campaigns` | All campaigns, shaped for a selector. |
+| `GET /campaigns/{record_id}/detail?basis=` | Targets, funnel, activity feed, linked deals, ROI. |
 | `GET /status/snitcher-review` | Snitcher Review entries at Status = New. |
 | `GET /status/allo-tag-registry` | `allo_tag_registry` from MotherDuck. |
 | `GET /config/flags` | Automation on/off flags with their resolved source. |
@@ -316,6 +318,47 @@ Three cases are not pushed:
 
 The last two stay put on purpose. They're the cases someone needs to look at,
 and silently dropping them is how a request disappears with nobody noticing.
+
+## Campaign tracking (`campaign_routes.py`)
+
+Backs the Ops Center's Campaign Detail page. Three things about it are
+non-obvious enough to be worth stating.
+
+**Campaign → List is a text field, not a reference.** Attio record-reference
+attributes can only point at other objects, never at Lists, so there is no
+native way to link a Campaign to its target List. The Campaigns object carries
+`target_list_slug` holding the list's `api_slug` (e.g. `bbcon_2026_targets`).
+Matching on list *name* was the alternative, and it breaks the first time
+someone renames a list.
+
+**Activity is joined at query time, and `contact_activity_log` gets no campaign
+column.** A contact can sit on several campaign lists at once — that is what
+Lists are for — so stamping one campaign onto a row when it's written forces a
+choice that isn't the row's to make. Campaign-scoped activity is a *view*: take
+the list's current members, join their emails against the log. This is a
+query-layer feature; there is no MotherDuck schema change.
+
+**Which deal field is the money.** Deals has three currency attributes and the
+obvious one is wrong:
+
+| Slug | Title | Populated? |
+| --- | --- | --- |
+| `value` | Deal value | **no — empty on every deal as of 2026-08-13** |
+| `deal_value_arr` | Deal Value - ARR | yes |
+| `deal_value_implementation` | Deal Value - Implementation | yes |
+
+Summing `value` returns `0.00` for every campaign while looking exactly like a
+working ROI panel — the same silent-success shape as the `type`-field bug in
+the AC receiver. The default basis is therefore **ARR + Implementation**
+(first-year contract value, which is what a campaign budget is being compared
+against). `?basis=arr_only|deal_value_field` switches it, the per-deal
+breakdown is always returned so a total can be audited rather than trusted, and
+`basis_all_empty` tells the UI to warn instead of rendering a confident zero.
+
+Attribute slugs are read off the live workspace, not inferred — several don't
+match their titles (`name_1`, `end_date_6`, `status_6`, `campaign_4`, and
+Campaigns' Associated Deals is `campaign_name_2`), because Attio suffixes a
+slug when it collides with one that existed before.
 
 ### Outlook drafts
 
