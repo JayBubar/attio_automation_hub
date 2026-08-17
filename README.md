@@ -398,8 +398,25 @@ was the 400 left after the `person:` prefix fix. All corrected.
 message, which names the offending attribute and says what was wrong with it,
 leaving only `400 Client Error: Bad Request for url: …`. That is why a
 one-field shape mistake took three rounds of live testing to locate. The PATCH
-helpers here and in `smartlead_routes.py` now print `resp.text` and the
-rejected payload first.
+helpers here and in `smartlead_routes.py`, and both `attio_add_to_list()`
+implementations, now print `resp.text` and the rejected payload first.
+
+### `entry_values` is required on list adds
+
+`POST /v2/lists/{list}/entries` lists **three** required fields in its schema:
+`parent_record_id`, `parent_object`, **and `entry_values`**. Omitting the third
+400s even when there is nothing to put in it, which is what failed the list-add
+after the PATCH was fixed.
+
+`{}` is the correct value here, not a placeholder — "Current Marketing
+Prospects in ActiveCampaign" has no writable entry attributes, only Attio's
+built-in `entry_id` / `created_at` / `created_by`, none of which a caller sets.
+A list that *does* carry entry attributes (BBCON 2026 Targets, say) would take
+them here as `{"slug": value}`.
+
+Fixed in all three POST sites: this receiver, and both the initial call and the
+**retry branch** in `outreach_rotation.py` — the retry held its own copy of the
+body and would otherwise have replayed the same malformed request.
 
 ## ⚠️ Suppression fields that don't exist
 

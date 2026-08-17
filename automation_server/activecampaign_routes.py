@@ -197,14 +197,34 @@ def attio_add_to_list(record_id):
     if not ATTIO_AC_LIST_ID:
         print("AC webhook: ATTIO_AC_TARGET_LIST_ID unset -- skipping list add")
         return False
+    body = {
+        "data": {
+            "parent_record_id": record_id,
+            "parent_object": "people",
+            # Required by Attio's schema, not optional -- `parent_record_id`,
+            # `parent_object` and `entry_values` are all listed under `required`
+            # on this endpoint, so omitting it 400s even when there is nothing
+            # to put in it. Empty is correct here rather than a placeholder:
+            # "Current Marketing Prospects in ActiveCampaign" carries no
+            # writable entry attributes, only Attio's built-in entry_id /
+            # created_at / created_by, none of which a caller sets.
+            "entry_values": {},
+        }
+    }
     resp = requests.post(
         f"{ATTIO_BASE}/lists/{ATTIO_AC_LIST_ID}/entries",
         headers=attio_headers(),
-        json={"data": {"parent_record_id": record_id, "parent_object": "people"}},
+        json=body,
         timeout=HTTP_TIMEOUT,
     )
     if resp.status_code == 409:
         return True
+    if not resp.ok:
+        # Same reason as attio_patch_person: Attio's body names what it
+        # objected to and raise_for_status() throws it away.
+        print(f"AC webhook: Attio list-add for {record_id} failed "
+              f"{resp.status_code}: {resp.text[:1000]}")
+        print(f"AC webhook: rejected list-add body was {body}")
     resp.raise_for_status()
     return True
 

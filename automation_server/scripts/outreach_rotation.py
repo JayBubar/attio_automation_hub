@@ -270,10 +270,22 @@ def attio_add_to_list(list_id, record_id):
     if DRY_RUN:
         print(f"  [DRY RUN] would add {record_id} to list {list_id}")
         return
+    # `entry_values` is required by Attio's schema alongside parent_record_id
+    # and parent_object -- omitting it 400s regardless of whether the list has
+    # any writable entry attributes to fill in. Built once and reused by the
+    # retry below, which previously carried its own copy of the body and so
+    # would have replayed the same malformed request.
+    body = {
+        "data": {
+            "parent_record_id": record_id,
+            "parent_object": "people",
+            "entry_values": {},
+        }
+    }
     resp = requests.post(
         f"{ATTIO_BASE}/lists/{list_id}/entries",
         headers=attio_headers(),
-        json={"data": {"parent_record_id": record_id, "parent_object": "people"}},
+        json=body,
         timeout=30,
     )
     if resp.status_code == 409:
@@ -283,10 +295,14 @@ def attio_add_to_list(list_id, record_id):
             requests.post,
             f"{ATTIO_BASE}/lists/{list_id}/entries",
             headers=attio_headers(),
-            json={"data": {"parent_record_id": record_id, "parent_object": "people"}},
+            json=body,
             timeout=30,
         )
         return
+    if not resp.ok:
+        print(f"  Attio list-add for {record_id} failed "
+              f"{resp.status_code}: {resp.text[:1000]}")
+        print(f"  rejected list-add body was {body}")
     resp.raise_for_status()
 
 
