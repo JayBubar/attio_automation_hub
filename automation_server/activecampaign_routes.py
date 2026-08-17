@@ -33,6 +33,12 @@ email-only lookup did not. Email match is the fallback for contacts that
 predate the field or have it blank. A record id that no longer resolves
 (deleted or merged record) also falls back to email rather than failing.
 
+AC stores that field in Attio's record-reference form, `person:<uuid>`. The
+`person:` prefix belongs to the reference notation, not to the id, and every
+Attio API surface used here -- URL paths and `parent_record_id` bodies -- wants
+the bare UUID. It is stripped once by `bare_record_id()` at the point the field
+is read; sending it through unstripped 400'd the first lookup of every event.
+
 ## Attribute slugs
 
 Verified against the live workspace, not guessed:
@@ -89,20 +95,53 @@ def attio_find_person_by_email(email):
     return data[0]["id"]["record_id"] if data else None
 
 
+def bare_record_id(raw):
+    """Strip Attio's `person:` object prefix off a record id.
+
+    AC's `attio_record_id` custom field holds the full record-reference form,
+    `person:bcd7b7a0-...`. That prefix is how Attio denotes a reference inside a
+    JSON attribute value; it is not part of the id, and every API surface here
+    wants the bare UUID -- URL paths and `parent_record_id` bodies alike.
+    Passing it through produced
+
+        400 Bad Request for .../people/records/person:bcd7b7a0-...
+
+    on the very first lookup of every event.
+
+    Normalising here, at the one point the field is read, rather than at each
+    call site: the id reaches four places (the exists GET, the PATCH URL, the
+    list-add body, and the logged/returned value) and fixing only the one that
+    happened to throw would have left the other three to fail later and
+    differently.
+    """
+    return (raw or "").strip().split(":", 1)[-1].strip()
+
+
 def attio_person_exists(record_id):
-    """Confirm a record id from AC still resolves. Returns False on 404 so the
-    caller can fall back to email -- a stale id in AC (record since deleted or
-    merged away) must not stop the sync."""
+    """Confirm a record id from AC still resolves.
+
+    Any 4xx means "this id is not usable" -- 404 for a record deleted or merged
+    away, 400 for one Attio won't even parse -- and both should hand over to the
+    email fallback. Only 5xx raises: that is Attio having a problem, not the id
+    being wrong, and it should surface rather than be silently downgraded to a
+    missed sync.
+
+    Previously `raise_for_status()` sat below the 404 check, so a 400 escaped as
+    an unhandled HTTPError and 500'd the whole webhook -- which is what the
+    unstripped `person:` prefix was doing on every single event.
+    """
     try:
         resp = requests.get(
-            f"{ATTIO_BASE}/objects/people/records/{record_id}",
+            f"{ATTIO_BASE}/objects/people/records/{bare_record_id(record_id)}",
             headers=attio_headers(),
             timeout=HTTP_TIMEOUT,
         )
     except requests.RequestException as e:
         print(f"AC webhook: Attio lookup for record {record_id} failed ({e})")
         return False
-    if resp.status_code == 404:
+    if 400 <= resp.status_code < 500:
+        print(f"AC webhook: Attio rejected record id {record_id!r} "
+              f"({resp.status_code}); falling back to email")
         return False
     resp.raise_for_status()
     return True
@@ -160,8 +199,12 @@ def tags_from_payload(payload):
 
 
 def resolve_attio_record(payload):
-    """(record_id, how_it_was_found). Custom field first, email as fallback."""
-    record_id = (payload.get("contact[fields][attio_record_id]") or "").strip()
+    """(record_id, how_it_was_found). Custom field first, email as fallback.
+
+    The id is normalised on the way out, so every caller downstream gets a bare
+    UUID and none of them has to know AC stores the `person:`-prefixed form.
+    """
+    record_id = bare_record_id(payload.get("contact[fields][attio_record_id]"))
     if record_id and attio_person_exists(record_id):
         return record_id, "attio_record_id"
 

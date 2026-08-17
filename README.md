@@ -90,6 +90,16 @@ not mapped in AC.
 survives a contact changing their email address; a stale id (record deleted or
 merged) falls back to email rather than failing.
 
+AC stores that field in Attio's record-reference form — `person:<uuid>`. The
+`person:` prefix belongs to the reference notation, not to the id, and Attio's
+API wants the bare UUID in URL paths and `parent_record_id` bodies alike.
+Unstripped it produced `400 Bad Request` on the first lookup of every event, and
+because `raise_for_status()` sat below the 404 check the 400 escaped as an
+unhandled error and 500'd the webhook. `bare_record_id()` now strips it once,
+where the field is read, so all four downstream uses get a clean id; and any
+4xx from the existence check falls back to email instead of raising — a
+malformed id is a reason to try the other lookup, not to fail the sync.
+
 | AC state | Attio writes |
 | --- | --- |
 | tag present | `active_marketing_contact=true`, path `In Outreach`, date today, + list add |
