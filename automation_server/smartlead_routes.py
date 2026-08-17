@@ -80,6 +80,12 @@ def attio_patch_person(record_id, values):
         headers=attio_headers(),
         json={"data": {"values": values}},
     )
+    if not resp.ok:
+        # Attio names the offending attribute in the body; raise_for_status()
+        # throws that away and leaves a bare "400 Client Error". Log it first.
+        print(f"Smartlead webhook: Attio PATCH {record_id} failed "
+              f"{resp.status_code}: {resp.text[:1000]}")
+        print(f"Smartlead webhook: rejected payload was {values}")
     resp.raise_for_status()
 
 
@@ -132,18 +138,27 @@ async def smartlead_webhook(request: Request):
     elif event_type == "SEQUENCE_COMPLETED":
         attio_patch_person(record_id, {
             "active_cold_outreach_contact": [{"value": False}],
-            "prospect_path": [{"value": "Cold/Retry Pending"}],
+            "prospect_path": [{"status": "Cold/Retry Pending"}],
             "last_path_change_date": [{"value": today}],
         })
 
     elif event_type == "EMAIL_REPLIED":
         attio_patch_person(record_id, {
-            "prospect_path": [{"value": "Engaged"}],
+            "prospect_path": [{"status": "Engaged"}],
             "active_cold_outreach_contact": [{"value": False}],
             "last_path_change_date": [{"value": today}],
         })
 
     elif event_type == "EMAIL_BOUNCED":
+        # !! BROKEN, PENDING A DECISION -- do not assume this works. !!
+        # Neither `do_not_migrate` nor `exclude_reason` exists on People in the
+        # live workspace (checked against all 59 attributes, archived included,
+        # on 2026-08-13). Attio rejects a PATCH naming an unknown attribute
+        # *entirely*, so this call writes nothing at all -- the suppression flag
+        # and the two valid fields beside it are all lost together. Same failure
+        # mode already documented for `ac_contact_id` in outreach_rotation.py.
+        # Either create the two attributes in Attio or move suppression onto an
+        # existing field; see README "Suppression fields that don't exist".
         attio_patch_person(record_id, {
             "active_cold_outreach_contact": [{"value": False}],
             "do_not_migrate": [{"value": True}],
@@ -154,7 +169,7 @@ async def smartlead_webhook(request: Request):
     elif event_type == "LEAD_UNSUBSCRIBED":
         attio_patch_person(record_id, {
             "active_cold_outreach_contact": [{"value": False}],
-            "prospect_path": [{"value": "Not Interested"}],
+            "prospect_path": [{"status": "Not Interested"}],
             "last_path_change_date": [{"value": today}],
         })
 
@@ -163,21 +178,21 @@ async def smartlead_webhook(request: Request):
 
         if category in ENGAGED_CATEGORIES:
             attio_patch_person(record_id, {
-                "prospect_path": [{"value": "Engaged"}],
+                "prospect_path": [{"status": "Engaged"}],
                 "active_cold_outreach_contact": [{"value": False}],
                 "last_path_change_date": [{"value": today}],
             })
 
         elif category in NOT_INTERESTED_CATEGORIES:
             attio_patch_person(record_id, {
-                "prospect_path": [{"value": "Not Interested"}],
+                "prospect_path": [{"status": "Not Interested"}],
                 "active_cold_outreach_contact": [{"value": False}],
                 "last_path_change_date": [{"value": today}],
             })
 
         elif category in DO_NOT_CONTACT_CATEGORIES:
             attio_patch_person(record_id, {
-                "prospect_path": [{"value": "Not Interested"}],
+                "prospect_path": [{"status": "Not Interested"}],
                 "active_cold_outreach_contact": [{"value": False}],
                 "do_not_migrate": [{"value": True}],
                 "exclude_reason": [{"value": "Smartlead: Do Not Contact"}],

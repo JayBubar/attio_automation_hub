@@ -484,7 +484,7 @@ def evict_stale_ac(conn):
             print(f"  no AC contact found for {record_id}; clearing Attio flags only")
         attio_update_person(record_id, {
             "active_marketing_contact": [{"value": False}],
-            "prospect_path": [{"value": "Cold/Retry Pending"}],
+            "prospect_path": [{"status": "Cold/Retry Pending"}],
             "last_path_change_date": [{"value": datetime.now(timezone.utc).date().isoformat()}],
         }, dry_run_label="(AC evict)")
         checkpoint_rows.append((record_id, "activecampaign", "evict"))
@@ -627,7 +627,7 @@ def push_ac_batch(conn, headroom):
 
         values = {
             "active_marketing_contact": [{"value": True}],
-            "prospect_path": [{"value": "In Outreach"}],
+            "prospect_path": [{"status": "In Outreach"}],
             "last_path_change_date": [{"value": datetime.now(timezone.utc).date().isoformat()}],
         }
         if AC_CONTACT_ID_SLUG:
@@ -687,7 +687,7 @@ def push_smartlead_batch(conn, headroom):
     for email, record_id in record_map.items():
         attio_update_person(record_id, {
             "active_cold_outreach_contact": [{"value": True}],
-            "prospect_path": [{"value": "In Outreach"}],
+            "prospect_path": [{"status": "In Outreach"}],
             "last_path_change_date": [{"value": datetime.now(timezone.utc).date().isoformat()}],
         }, dry_run_label="(Smartlead push)")
 

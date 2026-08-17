@@ -47,6 +47,27 @@ Verified against the live workspace, not guessed:
                                          every PATCH here was 400ing)
   prospect_path              status
   last_path_change_date      date
+
+## Write shapes differ by attribute type
+
+The wrapper key is not interchangeable, and getting it wrong 400s the *entire*
+PATCH -- Attio rejects the whole request over one bad attribute, so the two
+correct fields in the same call are lost with it. Per Attio's attribute-type
+reference:
+
+  checkbox   [{"value": True}]          `value` accepted
+  date       [{"value": "2026-08-13"}]  `value` accepted
+  status     [{"status": "In Outreach"}]  `value` is NOT accepted
+  select     [{"option": "Booked Demo"}]  `value` is NOT accepted
+
+Status and select take the option *title* directly -- no need to look up a
+status_id or option_id, though both accept one in place of the title.
+
+`prospect_path` is a status attribute and had been written as
+`[{"value": ...}]`, which is what produced the 400 after the record-id prefix
+bug was cleared. A bare string (`"prospect_path": "In Outreach"`) is equally
+valid; the array-of-object form is kept here for consistency with the
+neighbouring fields.
 """
 
 import os
@@ -154,6 +175,15 @@ def attio_patch_person(record_id, values):
         json={"data": {"values": values}},
         timeout=HTTP_TIMEOUT,
     )
+    if not resp.ok:
+        # Attio's response body names the offending attribute and says what was
+        # wrong with the value. raise_for_status() discards all of it and leaves
+        # "400 Client Error: Bad Request for url: ...", which is how a
+        # one-field shape mistake cost three rounds of live testing to find.
+        # Log the body first, then raise.
+        print(f"AC webhook: Attio PATCH {record_id} failed "
+              f"{resp.status_code}: {resp.text[:1000]}")
+        print(f"AC webhook: rejected payload was {values}")
     resp.raise_for_status()
 
 
@@ -258,7 +288,7 @@ async def activecampaign_webhook(request: Request):
     if tag_applied:
         attio_patch_person(record_id, {
             "active_marketing_contact": [{"value": True}],
-            "prospect_path": [{"value": "In Outreach"}],
+            "prospect_path": [{"status": "In Outreach"}],
             "last_path_change_date": [{"value": today}],
         })
         listed = attio_add_to_list(record_id)
@@ -266,7 +296,7 @@ async def activecampaign_webhook(request: Request):
     else:
         attio_patch_person(record_id, {
             "active_marketing_contact": [{"value": False}],
-            "prospect_path": [{"value": "Cold/Retry Pending"}],
+            "prospect_path": [{"status": "Cold/Retry Pending"}],
             "last_path_change_date": [{"value": today}],
         })
         # List removal stays with the Attio-native workflow (Active Marketing

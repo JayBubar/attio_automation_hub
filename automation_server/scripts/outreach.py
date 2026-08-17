@@ -429,7 +429,7 @@ def update_prospect_path(session, record_id, new_status):
     resp = session.patch(
         f"{ATTIO_API_BASE}/objects/people/records/{record_id}",
         json={"data": {"values": {
-            "prospect_path": [{"value": new_status}],
+            "prospect_path": [{"status": new_status}],
             "last_path_change_date": [{"value": datetime.now(timezone.utc).date().isoformat()}],
         }}},
     )

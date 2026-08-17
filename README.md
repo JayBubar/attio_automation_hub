@@ -370,6 +370,60 @@ match their titles (`name_1`, `end_date_6`, `status_6`, `campaign_4`, and
 Campaigns' Associated Deals is `campaign_name_2`), because Attio suffixes a
 slug when it collides with one that existed before.
 
+## Attio write shapes differ by attribute type
+
+The wrapper key is not interchangeable, and a wrong one **400s the entire
+PATCH** — Attio rejects the whole request over a single bad attribute, so the
+correct fields in the same call are lost along with it. Per Attio's
+attribute-type reference:
+
+| Type | Write shape | `value` accepted? |
+| --- | --- | --- |
+| checkbox | `[{"value": true}]` | ✅ |
+| date | `[{"value": "2026-08-13"}]` | ✅ |
+| number / text | `[{"value": …}]` | ✅ |
+| **status** | `[{"status": "In Outreach"}]` | ❌ |
+| **select** | `[{"option": "Booked Demo"}]` | ❌ |
+
+Status and select take the option **title** directly — no `status_id` /
+`option_id` lookup needed, though both accept one instead. A bare string
+(`"prospect_path": "In Outreach"`) is also valid for all of these.
+
+`prospect_path` (status) was being written as `[{"value": …}]` in all four
+callers — this receiver, `smartlead_routes.py`, `outreach_rotation.py`, and
+`outreach.py` — and `call_outcome` (select) likewise in the Allo receiver. That
+was the 400 left after the `person:` prefix fix. All corrected.
+
+**Log the response body before raising.** `raise_for_status()` discards Attio's
+message, which names the offending attribute and says what was wrong with it,
+leaving only `400 Client Error: Bad Request for url: …`. That is why a
+one-field shape mistake took three rounds of live testing to locate. The PATCH
+helpers here and in `smartlead_routes.py` now print `resp.text` and the
+rejected payload first.
+
+## ⚠️ Suppression fields that don't exist
+
+`smartlead_routes.py` writes `do_not_migrate` and `exclude_reason` on
+`EMAIL_BOUNCED`, `Do Not Contact`, and the review-flag categories. **Neither
+attribute exists on People** — checked against all 59 attributes, archived
+included, on 2026-08-13.
+
+Because Attio rejects the whole PATCH, those handlers currently write
+*nothing*: a hard bounce does not even clear
+`active_cold_outreach_contact`, so bounced addresses stay in rotation. This
+needs a decision, not a guess:
+
+- **Create the two attributes in Attio** — closest to the original intent
+  (`do_not_migrate` checkbox, `exclude_reason` text).
+- **Reuse `ac_prospect_suppression`** — an existing select with options
+  Unsubscribed / Prospect / Cold Lead / Warm Lead, which may already be the
+  intended home for this.
+- **Drop them** and rely on `prospect_path = Not Interested` plus the cleared
+  outreach flag.
+
+Until then the code is left as-is with a loud comment rather than quietly
+edited, so the broken behaviour stays visible.
+
 ### Outlook drafts
 
 `graph_mail.py` uses **delegated** Graph permissions, not application ones:
