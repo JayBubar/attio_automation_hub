@@ -441,6 +441,55 @@ needs a decision, not a guess:
 Until then the code is left as-is with a loud comment rather than quietly
 edited, so the broken behaviour stays visible.
 
+## Task Runner queue mode
+
+`GET /tasks/{rep}?filter=&type=` returns open tasks **with their context
+embedded** -- notes, last emails, Prospect Path, company, phone, and an Attio
+deep link. Context ships with the queue rather than being fetched per card: the
+point of queue mode is that the next task is already there, and a round-trip on
+every advance puts the wait back where it was taken from.
+
+The `outreach_email_drafts` join is gone. The AI-draft review flow is out of
+scope, and the join meant every load paid a MotherDuck query for a field
+nothing rendered.
+
+### One source of truth for call outcomes
+
+`POST /tasks/{task_id}/log-call-outcome` and the Allo webhook resolve outcomes
+through the **same `allo_tag_registry` table**, via `call_outcomes.py`.
+
+A shared Python function was the obvious design and does not work here: the
+Allo receiver is a separate Railway service in a separate repo with no shared
+package, so there is nothing to import across. The registry already was the
+shared definition and the Allo receiver already read it. Changing what an
+outcome does is now a row edit both callers pick up on their next request --
+no redeploy of either service, and no way for the two to drift.
+
+`action_params.prospect_path` present means the outcome moves the funnel;
+absent means log only. That is how maintenance outcomes on a Client stay put
+without needing their own code path. `action_params.audience`
+(prospecting/maintenance) decides which subset Task Runner offers, so adding an
+outcome is a row plus a select option -- never a UI change.
+
+`scripts/setup_call_outcomes.py` seeds both sides and retires the superseded
+rows. Note that **select options can be created over the API** --
+`POST /v2/objects/people/attributes/{slug}/options` -- so this needs no Attio
+UI work.
+
+### Deadlines don't exist yet
+
+`deadline_at` is null on every task in the workspace (30 sampled across three
+pages, 2026-08-17), so today/overdue/upcoming all match nothing. Undated tasks
+report `due_bucket: "none"` and the response carries `bucket_counts`, so the UI
+explains an empty queue instead of just showing one. The filters start working
+the moment the cadence writes deadlines.
+
+### Email previews are not available
+
+Attio's email API returns metadata only and states outright that content is
+never returned, so the context panel shows subject, direction and date. There
+is no preview to fetch at any price.
+
 ### Outlook drafts
 
 `graph_mail.py` uses **delegated** Graph permissions, not application ones:

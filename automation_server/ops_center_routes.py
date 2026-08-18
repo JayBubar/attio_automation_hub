@@ -22,9 +22,11 @@ import secrets
 import socket
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import automation_config
+import call_outcomes
 import duckdb
 import ipv4_only
 import requests
@@ -83,6 +85,12 @@ SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
 # as a constant so /status/ac-bridge checks the path that is actually served
 # rather than a second copy of the string that can drift out of sync.
 AC_WEBHOOK_PATH = "/webhooks/activecampaign"
+
+# Attio web app base for deep links. Workspace slug confirmed via whoami
+# (workspace_name "RaiseTell"); override if the URL slug ever differs.
+ATTIO_APP_BASE = os.environ.get(
+    "ATTIO_APP_BASE", "https://app.attio.com/raisetell"
+)
 
 # Verified against the live workspace, not guessed.
 SNITCHER_REVIEW_LIST_ID = "6d4dce27-180c-42ed-b722-876f51e7c184"
@@ -216,10 +224,32 @@ def trigger_outreach_batch(
 # ---------------------------------------------------------------------------
 
 @router.get("/tasks/{rep}")
-def get_rep_tasks(rep: str, authorization: str | None = Header(None)):
-    """Open Attio tasks assigned to this rep, left-joined against the
-    AI-drafted email bodies in MotherDuck. Call tasks have no draft row by
-    design and come back with draft: null."""
+def get_rep_tasks(
+    rep: str,
+    filter: str = "all",
+    type: str = "all",
+    authorization: str | None = Header(None),
+):
+    """Open Attio tasks for one rep, with the context the queue renders.
+
+    Context is embedded per task rather than fetched as the queue advances. The
+    whole point of queue mode is that the next card is already there; a
+    round-trip per advance would put the wait back exactly where it was taken
+    from. The cost is a few extra Attio calls per task at load time, paid once.
+
+    The AI-draft join is gone -- `outreach_email_drafts` is out of scope for
+    this redesign, and keeping it meant every load paid a MotherDuck query for
+    a field nothing rendered.
+
+    ## `filter` is mostly aspirational right now
+
+    `deadline_at` is null on every task in the workspace (30 sampled across
+    three pages, 2026-08-17), so today/overdue/upcoming each match nothing and
+    `all` matches everything. Rather than silently serving an empty queue,
+    undated tasks report `due_bucket: "none"` and the response carries
+    `bucket_counts`, so the UI can say *why* a filter is empty instead of
+    looking broken. The filters start working the moment tasks carry deadlines.
+    """
     _check_auth(authorization)
     _check_rep(rep)
     member_id = REP_MEMBER_IDS[rep]
@@ -249,52 +279,264 @@ def get_rep_tasks(rep: str, authorization: str | None = Header(None)):
         )
 
     mine = [t for t in tasks if assigned_to_rep(t)]
-    task_ids = [t["id"]["task_id"] for t in mine]
 
-    drafts = {}
-    if task_ids:
-        con = md_connection()
-        try:
-            placeholders = ",".join("?" for _ in task_ids)
-            cur = con.execute(
-                f"""SELECT task_id, subject, body, sequence_position
-                    FROM {MOTHERDUCK_DB}.main.outreach_email_drafts
-                    WHERE task_id IN ({placeholders})""",
-                task_ids,
-            )
-            drafts = {r["task_id"]: r for r in rows_to_dicts(cur)}
-        finally:
-            con.close()
-
-    def company_from_content(content: str):
-        """Cadence tasks are titled "Email 1/3 · {company}: {contact}".
-        Anything else is a hand-written task with no company to parse --
-        return None rather than echoing the whole title back as a company."""
-        if "·" not in content:
-            return None
-        return content.split("·", 1)[1].split(":", 1)[0].strip() or None
-
-    out = []
+    shaped = []
     for t in mine:
-        task_id = t["id"]["task_id"]
-        linked = t.get("linked_records") or []
-        d = drafts.get(task_id)
         content = t.get("content_plaintext") or t.get("content") or ""
-        out.append({
-            "task_id": task_id,
+        person_id = _linked_person_id(t.get("linked_records") or [])
+        shaped.append({
+            "task_id": t["id"]["task_id"],
             "content": content,
             "deadline_at": t.get("deadline_at"),
+            "due_bucket": _due_bucket(t.get("deadline_at")),
+            "task_type": _task_type(content),
             "company_name": company_from_content(content),
-            "linked_record_id": linked[0].get("target_record_id") if linked else None,
-            "draft": (
-                {"subject": d["subject"], "body": d["body"],
-                 "sequence_position": d["sequence_position"]} if d else None
-            ),
+            "linked_record_id": person_id,
         })
 
-    out.sort(key=lambda t: (t["deadline_at"] or "9999"))
-    return out
+    bucket_counts = {}
+    type_counts = {}
+    for s in shaped:
+        bucket_counts[s["due_bucket"]] = bucket_counts.get(s["due_bucket"], 0) + 1
+        type_counts[s["task_type"]] = type_counts.get(s["task_type"], 0) + 1
 
+    selected = [
+        s for s in shaped
+        if (filter == "all" or s["due_bucket"] == filter)
+        and (type == "all" or s["task_type"] == type)
+    ]
+
+    # Undated tasks have no meaningful due order, so fall back to the order the
+    # cadence created them in.
+    selected.sort(key=lambda s: (s["deadline_at"] or "9999", s["content"]))
+
+    # Context only for what the queue will actually show.
+    for s in selected:
+        s["context"] = _task_context(s["linked_record_id"])
+
+    return {
+        "rep": rep,
+        "filter": filter,
+        "type": type,
+        "total_open": len(shaped),
+        "returned": len(selected),
+        "bucket_counts": bucket_counts,
+        "type_counts": type_counts,
+        "tasks": selected,
+    }
+
+
+def company_from_content(content: str):
+    """Cadence tasks are titled "Email 1/3 . {company}: {contact}". Anything
+    else is a hand-written task with no company to parse -- return None rather
+    than echoing the whole title back as a company name."""
+    if "·" not in (content or ""):
+        return None
+    return content.split("·", 1)[1].split(":", 1)[0].strip() or None
+
+
+def _linked_person_id(linked):
+    """Task links can point at companies as well as people, and some tasks
+    carry no link at all. Only a person id is useful for the context panel."""
+    for link in linked:
+        if link.get("target_object") == "people":
+            return link.get("target_record_id")
+    return None
+
+
+def _due_bucket(deadline):
+    """today / overdue / upcoming / none. `none` is the honest answer for a
+    task with no deadline, and is currently every task in the workspace."""
+    if not deadline:
+        return "none"
+    try:
+        cleaned = re.sub(r"\.(\d{6})\d*", r".\1", str(deadline).replace("Z", "+00:00"))
+        due = datetime.fromisoformat(cleaned).date()
+    except ValueError:
+        return "none"
+    today = datetime.now(timezone.utc).date()
+    if due < today:
+        return "overdue"
+    return "today" if due == today else "upcoming"
+
+
+def _task_type(content):
+    """Derived from the task title, because Attio tasks have no type field.
+
+    The cadence writes "Call 2/3 - Company: Person" and "Email 1/3 - ...", so
+    the leading word is the signal. Anything else is hand-written and lands in
+    `followup`, the type whose UI assumes the least.
+    """
+    head = (content or "").strip().lower()
+    if head.startswith("call"):
+        return "call"
+    if head.startswith("email"):
+        return "email"
+    return "followup"
+
+
+def _task_context(person_record_id):
+    """Notes, emails, path, company and phone for one card.
+
+    Never raises. A context panel that fails must not take the task with it, so
+    each piece degrades independently and the queue keeps running with whatever
+    did load -- `errors` says what didn't.
+    """
+    ctx = {
+        "available": bool(person_record_id),
+        "person_name": None, "email": None, "phone": None,
+        "prospect_path": None, "company_name": None,
+        "notes": [], "emails": [], "attio_url": None,
+        "errors": [],
+    }
+    if not person_record_id:
+        ctx["errors"].append("Task has no linked person record.")
+        return ctx
+
+    ctx["attio_url"] = f"{ATTIO_APP_BASE}/person/{person_record_id}"
+
+    try:
+        r = requests.get(
+            f"{ATTIO_BASE}/objects/people/records/{person_record_id}",
+            headers=attio_headers(), timeout=20,
+        )
+        r.raise_for_status()
+        v = r.json()["data"]["values"]
+        ctx["person_name"] = _first(v, "name", "full_name")
+        ctx["email"] = _first(v, "email_addresses", "email_address")
+        ctx["phone"] = (_first(v, "cell_phone", "original_phone_number")
+                        or _first(v, "phone_numbers", "original_phone_number"))
+        ctx["prospect_path"] = _first(v, "prospect_path", "status")
+        company = (v.get("company") or [{}])[0].get("target_record_id")
+        if company:
+            ctx["company_name"] = _company_name(company)
+    except requests.RequestException as e:
+        ctx["errors"].append(f"record: {e}")
+
+    try:
+        r = requests.get(
+            f"{ATTIO_BASE}/notes", headers=attio_headers(),
+            params={"parent_object": "people", "parent_record_id": person_record_id,
+                    "limit": 3},
+            timeout=20,
+        )
+        r.raise_for_status()
+        for n in r.json().get("data", [])[:3]:
+            body = (n.get("content_plaintext") or "").strip()
+            ctx["notes"].append({
+                "title": n.get("title"),
+                "created_at": n.get("created_at"),
+                "preview": body[:400] + ("..." if len(body) > 400 else ""),
+            })
+    except requests.RequestException as e:
+        ctx["errors"].append(f"notes: {e}")
+
+    try:
+        r = requests.get(
+            f"{ATTIO_BASE}/emails", headers=attio_headers(),
+            params={"linked_object": "people",
+                    "linked_record_ids": person_record_id, "limit": 2},
+            timeout=20,
+        )
+        r.raise_for_status()
+        for item in r.json().get("data", [])[:2]:
+            ctx["emails"].append({
+                # No preview available at any price: Attio's email API returns
+                # metadata only and states outright that content is never
+                # returned. Subject, direction and date are the whole of it.
+                "subject": item.get("subject_line"),
+                "direction": item.get("direction"),
+                "sent_at": item.get("sent_at"),
+            })
+    except requests.RequestException as e:
+        ctx["errors"].append(f"emails: {e}")
+
+    return ctx
+
+
+def _first(values, slug, key):
+    """One value off an Attio attribute, tolerant of the per-type wrapper.
+
+    Status and select nest a whole object under their key
+    (`{"status": {"title": "In Outreach", ...}}`), so the dict case is
+    unwrapped *before* the direct hit -- returning the wrapper would make
+    `prospect_path == "Client"` never true, and Clients would silently be
+    offered the prospecting outcome list.
+    """
+    entry = (values.get(slug) or [{}])[0]
+    value = entry.get(key)
+    if isinstance(value, dict):
+        return value.get("title")
+    if value is not None:
+        return value
+    inner = entry.get("status") or entry.get("option")
+    if isinstance(inner, dict):
+        return inner.get("title")
+    return entry.get("value")
+
+
+def _company_name(company_record_id):
+    try:
+        r = requests.get(
+            f"{ATTIO_BASE}/objects/companies/records/{company_record_id}",
+            headers=attio_headers(), timeout=20,
+        )
+        r.raise_for_status()
+        return _first(r.json()["data"]["values"], "name", "value")
+    except requests.RequestException:
+        return None
+
+
+@router.post("/tasks/{task_id}/log-call-outcome")
+def log_call_outcome(
+    task_id: str,
+    record_id: str,
+    outcome: str,
+    note: str | None = None,
+    complete: bool = True,
+    authorization: str | None = Header(None),
+):
+    """Apply a call outcome, then optionally complete the task.
+
+    Delegates to call_outcomes.apply_outcome, which resolves the mapping from
+    `allo_tag_registry` -- the same table the Allo webhook reads. That is what
+    keeps "what does Left a VM actually do" defined in one place, whether it
+    was triggered by Allo's own call system or by a rep working the queue.
+
+    The task is completed only if the outcome actually applied. Completing a
+    task whose outcome write failed would bury the failure and lose the call.
+    """
+    _check_auth(authorization)
+
+    result = call_outcomes.apply_outcome(
+        record_id, outcome, note=note, source="task-runner")
+    if not result.get("ok"):
+        return {"ok": False, "task_completed": False, **result}
+
+    completed = False
+    if complete:
+        r = requests.patch(
+            f"{ATTIO_BASE}/tasks/{task_id}", headers=attio_headers(),
+            json={"data": {"is_completed": True}}, timeout=30,
+        )
+        completed = r.status_code < 400
+        if not completed:
+            result["complete_error"] = redact_secrets(r.text[:300])
+
+    return {"ok": True, "task_completed": completed, **result}
+
+
+@router.get("/call-outcomes")
+def list_call_outcomes(
+    prospect_path: str | None = None,
+    authorization: str | None = Header(None),
+):
+    """Outcome options for a contact on this path -- prospecting by default,
+    the maintenance subset for Clients. Served from the registry so the UI
+    never carries its own copy of the list."""
+    _check_auth(authorization)
+    return {"prospect_path": prospect_path,
+            "options": call_outcomes.outcome_options(prospect_path)}
 
 @router.post("/tasks/{task_id}/draft-email")
 def draft_task_email(
