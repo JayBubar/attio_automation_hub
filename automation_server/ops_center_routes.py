@@ -22,6 +22,7 @@ import secrets
 import socket
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -110,6 +111,11 @@ OUTREACH_SCRIPT = Path(__file__).resolve().parent / "scripts" / "outreach.py"
 # Must stay below the Ops Center's own HTTP timeout, so the caller sees a
 # real response rather than giving up while this keeps mutating Attio.
 OUTREACH_TIMEOUT_SECONDS = 600
+
+# Parallel Attio reads when building queue context. Every one is
+# network-blocked, so this is throughput, not CPU. Matches the pool size
+# scripts/outreach.py already uses for its company lookups.
+CONTEXT_WORKERS = 10
 
 
 def _check_auth(authorization: str | None):
@@ -228,6 +234,7 @@ def get_rep_tasks(
     rep: str,
     filter: str = "all",
     type: str = "all",
+    limit: int = 50,
     authorization: str | None = Header(None),
 ):
     """Open Attio tasks for one rep, with the context the queue renders.
@@ -310,16 +317,32 @@ def get_rep_tasks(
     # cadence created them in.
     selected.sort(key=lambda s: (s["deadline_at"] or "9999", s["content"]))
 
-    # Context only for what the queue will actually show.
-    for s in selected:
-        s["context"] = _task_context(s["linked_record_id"])
+    matched = len(selected)
+    # Bounded: context is 3-4 Attio calls per task, so an unbounded queue is an
+    # unbounded page load. Run one session's worth; the rep re-queues for more.
+    selected = selected[:max(1, limit)]
+
+    # Context in parallel, not in sequence. Serially this was 53-88s for one
+    # rep and growing with the task count -- past Streamlit's 120s timeout,
+    # which is what "the page loads nothing" actually was. Threads are the
+    # right tool here because every one of these is network-blocked, not
+    # CPU-bound.
+    company_cache = {}
+    with ThreadPoolExecutor(max_workers=CONTEXT_WORKERS) as pool:
+        contexts = list(pool.map(
+            lambda t: _task_context(t["linked_record_id"], company_cache), selected))
+    for task, ctx in zip(selected, contexts):
+        task["context"] = ctx
 
     return {
         "rep": rep,
         "filter": filter,
         "type": type,
         "total_open": len(shaped),
+        "matched": matched,
         "returned": len(selected),
+        "truncated": matched > len(selected),
+        "limit": limit,
         "bucket_counts": bucket_counts,
         "type_counts": type_counts,
         "tasks": selected,
@@ -393,7 +416,7 @@ def _task_type(content):
     return "followup"
 
 
-def _task_context(person_record_id):
+def _task_context(person_record_id, company_cache=None):
     """Notes, emails, path, company and phone for one card.
 
     Never raises. A context panel that fails must not take the task with it, so
@@ -427,7 +450,14 @@ def _task_context(person_record_id):
         ctx["prospect_path"] = _first(v, "prospect_path", "status")
         company = (v.get("company") or [{}])[0].get("target_record_id")
         if company:
-            ctx["company_name"] = _company_name(company)
+            # Cached across the queue: a cadence batch is many contacts at few
+            # companies, so this is the most repeated call of the three.
+            if company_cache is not None and company in company_cache:
+                ctx["company_name"] = company_cache[company]
+            else:
+                ctx["company_name"] = _company_name(company)
+                if company_cache is not None:
+                    company_cache[company] = ctx["company_name"]
     except requests.RequestException as e:
         ctx["errors"].append(f"record: {e}")
 

@@ -42,6 +42,7 @@ than trusted.
 """
 
 import os
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 from fastapi import APIRouter, Header, HTTPException
@@ -57,6 +58,11 @@ router = APIRouter()
 ATTIO_API_KEY = os.environ["ATTIO_API_KEY"]
 ATTIO_BASE = "https://api.attio.com/v2"
 HTTP_TIMEOUT = 30
+
+# Parallel member reads. Serially, a list of any size walked straight past
+# the caller's timeout -- the campaign detail route was returning 499
+# (client gave up) after 120s on a list of ordinary size.
+MEMBER_WORKERS = 10
 
 WON_STAGE = "Won"
 
@@ -188,18 +194,24 @@ def fetch_people(record_ids):
     only the entry's own attributes -- not the parent's email, which is the
     join key for the activity log. So this is N requests for N members.
 
-    Fine at conference-target-list scale (tens to low hundreds, behind a button
-    the user pressed). If a campaign list ever runs to thousands this becomes
-    the slow part of the page and wants a cached email crosswalk instead.
+    Fetched in parallel: serially this walked past the caller's 120s timeout on
+    an ordinary-sized list and the route returned 499 before it finished. Still
+    N requests, just not N round-trips deep.
+
+    If a campaign list ever runs to thousands this wants a cached email
+    crosswalk rather than a bigger pool.
     """
-    people = {}
-    for rid in record_ids:
+    def one(rid):
         try:
-            people[rid] = _get(f"{ATTIO_BASE}/objects/people/records/{rid}")
+            return rid, _get(f"{ATTIO_BASE}/objects/people/records/{rid}")
         except requests.RequestException as e:
             # One unreadable member must not blank the whole page.
             print(f"campaign: could not read person {rid} ({e})")
-    return people
+            return rid, None
+
+    with ThreadPoolExecutor(max_workers=MEMBER_WORKERS) as pool:
+        results = list(pool.map(one, record_ids))
+    return {rid: rec for rid, rec in results if rec is not None}
 
 
 # ---------------------------------------------------------------------------
