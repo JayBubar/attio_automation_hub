@@ -335,12 +335,30 @@ def company_from_content(content: str):
     return content.split("·", 1)[1].split(":", 1)[0].strip() or None
 
 
+# People object id, for matching task links that identify the object by UUID
+# rather than slug.
+PEOPLE_OBJECT_ID = "70e3d90c-7685-4058-9a6b-449c4fe5705c"
+
+
 def _linked_person_id(linked):
-    """Task links can point at companies as well as people, and some tasks
-    carry no link at all. Only a person id is useful for the context panel."""
-    for link in linked:
-        if link.get("target_object") == "people":
-            return link.get("target_record_id")
+    """Person record id off a task's links, or None.
+
+    Deliberately permissive about the key and the value. Attio documents the
+    field as `target_object_id`, the earlier code here read `target_object`
+    (which is never present, so this returned None for *every* task and the
+    whole context panel came back empty), and the value shows up as the object
+    slug in some responses and the object UUID in others. Accepting all of
+    those costs nothing; guessing one and being wrong silently empties the
+    panel, which is exactly what happened.
+
+    Company-linked tasks still return None on purpose -- a company is not a
+    person, and the context panel is person-shaped.
+    """
+    for link in linked or []:
+        obj = (link.get("target_object_id") or link.get("target_object")
+               or link.get("object_id"))
+        if obj in ("people", PEOPLE_OBJECT_ID):
+            return link.get("target_record_id") or link.get("record_id")
     return None
 
 
