@@ -47,6 +47,8 @@ from concurrent.futures import ThreadPoolExecutor
 import requests
 from fastapi import APIRouter, Header, HTTPException
 
+import http_client
+
 # Auth and the MotherDuck connection are defined once, in ops_center_routes,
 # and imported rather than re-implemented -- a second copy of the auth check is
 # a second thing to forget to fix. main.py imports both modules and
@@ -57,7 +59,6 @@ router = APIRouter()
 
 ATTIO_API_KEY = os.environ["ATTIO_API_KEY"]
 ATTIO_BASE = "https://api.attio.com/v2"
-HTTP_TIMEOUT = 30
 
 # Parallel member reads. Serially, a list of any size walked straight past
 # the caller's timeout -- the campaign detail route was returning 499
@@ -149,7 +150,7 @@ def _money(values, slug):
 # ---------------------------------------------------------------------------
 
 def _get(url):
-    resp = requests.get(url, headers=attio_headers(), timeout=HTTP_TIMEOUT)
+    resp = http_client.get(url, headers=attio_headers())
     resp.raise_for_status()
     return resp.json()["data"]
 
@@ -159,10 +160,9 @@ def _query_all(url, body=None, limit=500):
     out = []
     offset = 0
     while True:
-        resp = requests.post(
+        resp = http_client.post(
             url, headers=attio_headers(),
             json={**(body or {}), "limit": limit, "offset": offset},
-            timeout=HTTP_TIMEOUT,
         )
         resp.raise_for_status()
         page = resp.json().get("data", [])
@@ -222,8 +222,12 @@ def fetch_people(record_ids):
 def list_campaigns(authorization: str | None = Header(None)):
     """Every campaign, shaped for a selector."""
     _check_auth(authorization)
+    try:
+        campaigns = fetch_campaigns()
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
     out = []
-    for rec in fetch_campaigns():
+    for rec in campaigns:
         v = rec.get("values", {})
         out.append({
             "record_id": rec["id"]["record_id"],
@@ -262,6 +266,8 @@ def campaign_detail(
         code = e.response.status_code if e.response is not None else 502
         raise HTTPException(status_code=404 if code == 404 else 502,
                             detail=f"campaign {record_id} could not be read")
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
     cv = campaign.get("values", {})
 
     budget = _money(cv, C_BUDGET)
@@ -298,6 +304,9 @@ def campaign_detail(
                 "the campaign does not match a real list — check it for a typo "
                 "or a renamed list."
             )
+        except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+            entries = []
+            list_error = f"Attio temporarily unreachable while reading the target list: {e}"
         if not list_error:
             parent_ids = [e.get("parent_record_id") for e in entries if e.get("parent_record_id")]
             people = fetch_people(parent_ids)
@@ -341,7 +350,10 @@ def campaign_detail(
     out["activity"] = campaign_activity(emails)
 
     # --- Deals and ROI -----------------------------------------------------
-    out["deals"] = campaign_deals(record_id, basis)
+    try:
+        out["deals"] = campaign_deals(record_id, basis)
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
     won = out["deals"]["won_value"]
     out["roi"] = {
         "budget": budget,

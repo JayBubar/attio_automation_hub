@@ -33,6 +33,9 @@ from datetime import datetime, timezone
 
 import requests
 from fastapi import APIRouter, Request, HTTPException
+from fastapi.concurrency import run_in_threadpool
+
+import http_client
 
 router = APIRouter()
 
@@ -69,13 +72,13 @@ def attio_headers():
 
 
 def attio_get_person(record_id):
-    resp = requests.get(f"{ATTIO_BASE}/objects/people/records/{record_id}", headers=attio_headers())
+    resp = http_client.get(f"{ATTIO_BASE}/objects/people/records/{record_id}", headers=attio_headers())
     resp.raise_for_status()
     return resp.json()["data"]
 
 
 def attio_patch_person(record_id, values):
-    resp = requests.patch(
+    resp = http_client.patch(
         f"{ATTIO_BASE}/objects/people/records/{record_id}",
         headers=attio_headers(),
         json={"data": {"values": values}},
@@ -123,6 +126,18 @@ async def smartlead_webhook(request: Request):
             raise HTTPException(status_code=401, detail="invalid signature")
 
     payload = await request.json()
+    # This route is `async def` (needed for `await request.json()`), but
+    # everything below is blocking `requests` calls to Attio. Run it in the
+    # same worker pool FastAPI uses for sync routes rather than directly on
+    # the event loop -- otherwise a slow/unreachable Attio freezes every
+    # other request this process is handling, not just this one.
+    try:
+        return await run_in_threadpool(_process_smartlead_webhook, payload)
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
+
+
+def _process_smartlead_webhook(payload):
     event_type = payload.get("event_type")
     record_id = extract_record_id(payload)
 

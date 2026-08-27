@@ -59,7 +59,9 @@ from datetime import datetime, timezone
 import duckdb
 import requests
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
+import http_client
 from activecampaign_routes import attio_find_person_by_email, attio_headers
 
 router = APIRouter()
@@ -145,11 +147,10 @@ def attio_append_filled_form(record_id: str, option_title: str):
     `option_title` is the Attio side of TRACKED_FORMS, not the AC automation
     name. Passing the automation name here would 400.
     """
-    resp = requests.patch(
+    resp = http_client.patch(
         f"{ATTIO_BASE}/objects/people/records/{record_id}",
         headers=attio_headers(),
         json={"data": {"values": {FILLED_FORM_SLUG: [{"option": option_title}]}}},
-        timeout=30,
     )
     resp.raise_for_status()
 
@@ -192,6 +193,15 @@ async def ac_form_fill_webhook(
 
     print(f"AC form-fill payload: form={form!r} {payload}")
 
+    # Parsing the request above needed `async def`; everything from here is
+    # blocking `requests`/duckdb calls, so it runs in the same worker pool
+    # FastAPI uses for sync routes rather than directly on the event loop --
+    # otherwise a slow/unreachable Attio freezes every other request this
+    # process is handling, not just this one.
+    return await run_in_threadpool(_process_form_fill, form, payload)
+
+
+def _process_form_fill(form, payload):
     raw_form = _resolve_form(form, payload)
     email = _resolve_email(payload)
     canonical_form = _FORMS_BY_KEY.get((raw_form or "").strip().casefold())

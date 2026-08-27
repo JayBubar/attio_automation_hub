@@ -47,6 +47,8 @@ import requests
 from fastapi import APIRouter, Header, HTTPException
 from fastapi.responses import HTMLResponse, RedirectResponse
 
+import http_client
+
 router = APIRouter()
 
 AZURE_TENANT_ID = os.environ.get("AZURE_TENANT_ID", "")
@@ -164,17 +166,19 @@ def access_token_for(rep: str) -> tuple[str, str]:
         )
     refresh_token, upn = row
 
-    resp = requests.post(
-        f"{_authority()}/token",
-        data={
-            "client_id": AZURE_CLIENT_ID,
-            "client_secret": AZURE_CLIENT_SECRET,
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "scope": GRAPH_SCOPES,
-        },
-        timeout=30,
-    )
+    try:
+        resp = http_client.post(
+            f"{_authority()}/token",
+            data={
+                "client_id": AZURE_CLIENT_ID,
+                "client_secret": AZURE_CLIENT_SECRET,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "scope": GRAPH_SCOPES,
+            },
+        )
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Microsoft Graph temporarily unreachable: {e}")
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=502,
@@ -196,16 +200,18 @@ def create_outlook_draft(rep: str, to_address: str, subject: str, body: str) -> 
     the message resource, so it is not sent in the body.
     """
     token, upn = access_token_for(rep)
-    resp = requests.post(
-        f"{GRAPH_BASE}/me/messages",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={
-            "subject": subject,
-            "body": {"contentType": "Text", "content": body},
-            "toRecipients": [{"emailAddress": {"address": to_address}}],
-        },
-        timeout=30,
-    )
+    try:
+        resp = http_client.post(
+            f"{GRAPH_BASE}/me/messages",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={
+                "subject": subject,
+                "body": {"contentType": "Text", "content": body},
+                "toRecipients": [{"emailAddress": {"address": to_address}}],
+            },
+        )
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Microsoft Graph temporarily unreachable: {e}")
     if resp.status_code >= 400:
         raise HTTPException(
             status_code=resp.status_code,
@@ -266,18 +272,23 @@ def microsoft_auth_callback(
     _require_config()
     rep = _verify_state(state)
 
-    resp = requests.post(
-        f"{_authority()}/token",
-        data={
-            "client_id": AZURE_CLIENT_ID,
-            "client_secret": AZURE_CLIENT_SECRET,
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": _redirect_uri(),
-            "scope": GRAPH_SCOPES,
-        },
-        timeout=30,
-    )
+    try:
+        resp = http_client.post(
+            f"{_authority()}/token",
+            data={
+                "client_id": AZURE_CLIENT_ID,
+                "client_secret": AZURE_CLIENT_SECRET,
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": _redirect_uri(),
+                "scope": GRAPH_SCOPES,
+            },
+        )
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        return HTMLResponse(
+            f"<h3>Microsoft was temporarily unreachable</h3><p>{e}</p>"
+            "<p>Try signing in again.</p>", status_code=503,
+        )
     if resp.status_code >= 400:
         return HTMLResponse(
             f"<h3>Token exchange failed</h3><pre>{resp.text[:600]}</pre>"
@@ -287,12 +298,14 @@ def microsoft_auth_callback(
         )
     payload = resp.json()
 
-    me = requests.get(
-        f"{GRAPH_BASE}/me",
-        headers={"Authorization": f"Bearer {payload['access_token']}"},
-        timeout=30,
-    )
-    upn = me.json().get("userPrincipalName", "unknown") if me.ok else "unknown"
+    try:
+        me = http_client.get(
+            f"{GRAPH_BASE}/me",
+            headers={"Authorization": f"Bearer {payload['access_token']}"},
+        )
+        upn = me.json().get("userPrincipalName", "unknown") if me.ok else "unknown"
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS:
+        upn = "unknown"
 
     _store_refresh_token(rep, upn, payload["refresh_token"])
     return HTMLResponse(

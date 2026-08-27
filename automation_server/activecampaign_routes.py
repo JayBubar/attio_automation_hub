@@ -74,8 +74,10 @@ import os
 from datetime import datetime, timezone
 
 import requests
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.concurrency import run_in_threadpool
 
+import http_client
 import webhook_log
 
 router = APIRouter()
@@ -97,19 +99,16 @@ ATTIO_AC_LIST_ID = os.environ.get(
 AC_SERIES_ID = os.environ.get("ACTIVECAMPAIGN_SERIES_ID", "15")
 AC_MARKETING_TAG = os.environ.get("ACTIVECAMPAIGN_MARKETING_TAG", "Attio Marketing Contact")
 
-HTTP_TIMEOUT = 30
-
 
 def attio_headers():
     return {"Authorization": f"Bearer {ATTIO_API_KEY}", "Content-Type": "application/json"}
 
 
 def attio_find_person_by_email(email):
-    resp = requests.post(
+    resp = http_client.post(
         f"{ATTIO_BASE}/objects/people/records/query",
         headers=attio_headers(),
         json={"filter": {"email_addresses": {"email_address": {"$eq": email}}}, "limit": 1},
-        timeout=HTTP_TIMEOUT,
     )
     resp.raise_for_status()
     data = resp.json().get("data", [])
@@ -152,10 +151,9 @@ def attio_person_exists(record_id):
     unstripped `person:` prefix was doing on every single event.
     """
     try:
-        resp = requests.get(
+        resp = http_client.get(
             f"{ATTIO_BASE}/objects/people/records/{bare_record_id(record_id)}",
             headers=attio_headers(),
-            timeout=HTTP_TIMEOUT,
         )
     except requests.RequestException as e:
         print(f"AC webhook: Attio lookup for record {record_id} failed ({e})")
@@ -169,11 +167,10 @@ def attio_person_exists(record_id):
 
 
 def attio_patch_person(record_id, values):
-    resp = requests.patch(
+    resp = http_client.patch(
         f"{ATTIO_BASE}/objects/people/records/{record_id}",
         headers=attio_headers(),
         json={"data": {"values": values}},
-        timeout=HTTP_TIMEOUT,
     )
     if not resp.ok:
         # Attio's response body names the offending attribute and says what was
@@ -211,11 +208,10 @@ def attio_add_to_list(record_id):
             "entry_values": {},
         }
     }
-    resp = requests.post(
+    resp = http_client.post(
         f"{ATTIO_BASE}/lists/{ATTIO_AC_LIST_ID}/entries",
         headers=attio_headers(),
         json=body,
-        timeout=HTTP_TIMEOUT,
     )
     if resp.status_code == 409:
         return True
@@ -272,6 +268,18 @@ def resolve_attio_record(payload):
 async def activecampaign_webhook(request: Request):
     form = await request.form()
     payload = dict(form)
+    # `async def` is only needed for `await request.form()` above -- the rest
+    # of this handler is blocking `requests` calls to Attio. Run it in the
+    # same worker pool FastAPI uses for sync routes rather than directly on
+    # the event loop -- otherwise a slow/unreachable Attio freezes every
+    # other request this process is handling, not just this one.
+    try:
+        return await run_in_threadpool(_process_activecampaign_webhook, payload)
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
+
+
+def _process_activecampaign_webhook(payload):
     print(f"AC webhook payload: {payload}")
 
     series_id = str(payload.get("seriesid", "")).strip()

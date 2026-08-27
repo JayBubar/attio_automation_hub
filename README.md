@@ -466,13 +466,52 @@ outcome does is now a row edit both callers pick up on their next request --
 no redeploy of either service, and no way for the two to drift.
 
 `action_params.prospect_path` present means the outcome moves the funnel;
-absent means log only. That is how maintenance outcomes on a Client stay put
-without needing their own code path. `action_params.audience`
-(prospecting/maintenance) decides which subset Task Runner offers, so adding an
-outcome is a row plus a select option -- never a UI change.
+absent means log only. `action_params.attio_call_outcome` is the option title
+to write, which is Attio's vocabulary and is allowed to differ from the tag
+name, which is Allo's. `call_outcomes.py` dispatches on `action_type` exactly
+as the receiver does, so `Follow-up Later` creates a 48h callback task on both
+paths instead of being written to the field on one of them.
 
-`scripts/setup_call_outcomes.py` seeds both sides and retires the superseded
-rows. Note that **select options can be created over the API** --
+### Two outcome fields, not one filtered field
+
+Prospecting and maintenance outcomes are different metrics for different
+purposes -- one triggers automation, the other is tracking that justifies
+future CS headcount -- so mixing them in one field muddies reporting on both.
+They are two live Attio fields:
+
+| | `call_outcome` | `direct_call_outcome` |
+| --- | --- | --- |
+| Audience | everyone not yet a Client | Prospect Path = Client |
+| Options | 7, one per Allo tag | 8, maintenance |
+| Written by | Allo AI tagging + Task Runner | Task Runner only |
+| Source of the list | `allo_tag_registry` | the Attio field itself |
+| Moves Prospect Path | per the registry row | never |
+
+Which one a card shows is decided by the contact's Prospect Path *server-side*,
+and the field slug ships with the options -- Streamlit never holds a copy of
+either list, and the write lands in the field whose options the rep was shown.
+
+Maintenance outcomes deliberately have **no registry rows**: nothing in Allo
+emits them and nothing maps them to a path change, so the Attio field is the
+only place that list should live. Adding one is a select option, not a row and
+not a code change.
+
+Neither list has a **No Answer**, on purpose. An unconnected call arrives from
+Allo as `call.completed` with no tag at all; `Allo Calls Count` on the person
+record is what tracks attempt volume, and a second option counting the same
+thing would be worse than none.
+
+`Send Information` writes the field and stops there. Enrolment in the one-email
+informational sequence is an **Attio-native Workflow** triggering on that value
+-- not an AC automation, which was the original plan and was reversed: these
+contacts generally aren't in AC, and getting them there to send one email isn't
+worth the complexity. Nothing in the hub needs to know it happens.
+
+`scripts/setup_call_outcomes.py` reports drift between the registry, the two
+fields, and the forbidden entries; `--apply` creates missing select options. It
+no longer writes `allo_tag_registry` -- a script that rewrote the table from a
+hardcoded list made the registry a cache of that file, which is the inverse of
+the point. Note that **select options can be created over the API** --
 `POST /v2/objects/people/attributes/{slug}/options` -- so this needs no Attio
 UI work.
 

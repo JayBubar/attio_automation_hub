@@ -22,6 +22,7 @@ import secrets
 import socket
 import subprocess
 import sys
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -29,6 +30,7 @@ from pathlib import Path
 import automation_config
 import call_outcomes
 import duckdb
+import http_client
 import ipv4_only
 import requests
 import webhook_log
@@ -117,6 +119,12 @@ OUTREACH_TIMEOUT_SECONDS = 600
 # scripts/outreach.py already uses for its company lookups.
 CONTEXT_WORKERS = 10
 
+# Attio's own page size when listing tasks, kept separate from the queue bound
+# the caller asks for. These were one name until the inner loop reassigned it,
+# which quietly raised every queue's cap to 500 -- 500 tasks x 3-4 context
+# calls is the unbounded page load the cap existed to prevent.
+TASK_PAGE_SIZE = 500
+
 
 def _check_auth(authorization: str | None):
     if not OPS_CENTER_TOKEN:
@@ -159,6 +167,24 @@ def redact_secrets(text: str) -> str:
 def rows_to_dicts(cursor):
     cols = [d[0] for d in cursor.description]
     return [dict(zip(cols, row)) for row in cursor.fetchall()]
+
+
+# Short-TTL cache for status routes that call out to a vendor (Smartlead,
+# Attio). The Ops Center status board polls these on every page load, so a
+# flaky window for the vendor otherwise fails every single poll during it
+# rather than just the one that happened to land inside it.
+_STATUS_CACHE = {}
+_STATUS_CACHE_TTL = 30
+
+
+def _cached_status(key, build):
+    now = time.time()
+    hit = _STATUS_CACHE.get(key)
+    if hit is not None and now - hit[0] < _STATUS_CACHE_TTL:
+        return hit[1]
+    value = build()
+    _STATUS_CACHE[key] = (now, value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -263,21 +289,22 @@ def get_rep_tasks(
 
     tasks = []
     offset = 0
-    limit = 500
-    while True:
-        resp = requests.get(
-            f"{ATTIO_BASE}/tasks",
-            headers=attio_headers(),
-            params={"limit": limit, "offset": offset, "is_completed": "false",
-                    "sort": "created_at:asc"},
-            timeout=30,
-        )
-        resp.raise_for_status()
-        page = resp.json().get("data", [])
-        tasks.extend(page)
-        if len(page) < limit:
-            break
-        offset += limit
+    try:
+        while True:
+            resp = http_client.get(
+                f"{ATTIO_BASE}/tasks",
+                headers=attio_headers(),
+                params={"limit": TASK_PAGE_SIZE, "offset": offset, "is_completed": "false",
+                        "sort": "created_at:asc"},
+            )
+            resp.raise_for_status()
+            page = resp.json().get("data", [])
+            tasks.extend(page)
+            if len(page) < TASK_PAGE_SIZE:
+                break
+            offset += TASK_PAGE_SIZE
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
 
     def assigned_to_rep(task):
         return any(
@@ -437,9 +464,9 @@ def _task_context(person_record_id, company_cache=None):
     ctx["attio_url"] = f"{ATTIO_APP_BASE}/person/{person_record_id}"
 
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{ATTIO_BASE}/objects/people/records/{person_record_id}",
-            headers=attio_headers(), timeout=20,
+            headers=attio_headers(),
         )
         r.raise_for_status()
         v = r.json()["data"]["values"]
@@ -462,11 +489,10 @@ def _task_context(person_record_id, company_cache=None):
         ctx["errors"].append(f"record: {e}")
 
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{ATTIO_BASE}/notes", headers=attio_headers(),
             params={"parent_object": "people", "parent_record_id": person_record_id,
                     "limit": 3},
-            timeout=20,
         )
         r.raise_for_status()
         for n in r.json().get("data", [])[:3]:
@@ -480,11 +506,10 @@ def _task_context(person_record_id, company_cache=None):
         ctx["errors"].append(f"notes: {e}")
 
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{ATTIO_BASE}/emails", headers=attio_headers(),
             params={"linked_object": "people",
                     "linked_record_ids": person_record_id, "limit": 2},
-            timeout=20,
         )
         r.raise_for_status()
         for item in r.json().get("data", [])[:2]:
@@ -525,9 +550,9 @@ def _first(values, slug, key):
 
 def _company_name(company_record_id):
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{ATTIO_BASE}/objects/companies/records/{company_record_id}",
-            headers=attio_headers(), timeout=20,
+            headers=attio_headers(),
         )
         r.raise_for_status()
         return _first(r.json()["data"]["values"], "name", "value")
@@ -542,14 +567,27 @@ def log_call_outcome(
     outcome: str,
     note: str | None = None,
     complete: bool = True,
+    prospect_path: str | None = None,
+    rep: str | None = None,
     authorization: str | None = Header(None),
 ):
     """Apply a call outcome, then optionally complete the task.
 
     Delegates to call_outcomes.apply_outcome, which resolves the mapping from
     `allo_tag_registry` -- the same table the Allo webhook reads. That is what
-    keeps "what does Left a VM actually do" defined in one place, whether it
-    was triggered by Allo's own call system or by a rep working the queue.
+    keeps "what does Send Information actually do" defined in one place,
+    whether it was triggered by Allo's own call system or by a rep working the
+    queue.
+
+    `prospect_path` is the contact's path as the card was loaded, and decides
+    which of the two outcome fields is in play: Client goes to
+    `direct_call_outcome` with no path logic at all, everyone else through the
+    registry to `call_outcome`. It is passed rather than re-read so the write
+    lands in the field whose options the rep was actually shown.
+
+    `rep` is only needed by outcomes the registry models as a callback task
+    (Follow-up Later); it resolves to the Attio workspace member the new task
+    is assigned to.
 
     The task is completed only if the outcome actually applied. Completing a
     task whose outcome write failed would bury the failure and lose the call.
@@ -557,19 +595,25 @@ def log_call_outcome(
     _check_auth(authorization)
 
     result = call_outcomes.apply_outcome(
-        record_id, outcome, note=note, source="task-runner")
+        record_id, outcome, note=note, source="task-runner",
+        prospect_path=prospect_path,
+        assignee_id=REP_MEMBER_IDS.get((rep or "").lower()),
+    )
     if not result.get("ok"):
         return {"ok": False, "task_completed": False, **result}
 
     completed = False
     if complete:
-        r = requests.patch(
-            f"{ATTIO_BASE}/tasks/{task_id}", headers=attio_headers(),
-            json={"data": {"is_completed": True}}, timeout=30,
-        )
-        completed = r.status_code < 400
-        if not completed:
-            result["complete_error"] = redact_secrets(r.text[:300])
+        try:
+            r = http_client.patch(
+                f"{ATTIO_BASE}/tasks/{task_id}", headers=attio_headers(),
+                json={"data": {"is_completed": True}},
+            )
+            completed = r.status_code < 400
+            if not completed:
+                result["complete_error"] = redact_secrets(r.text[:300])
+        except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+            result["complete_error"] = f"Attio temporarily unreachable: {e}"
 
     return {"ok": True, "task_completed": completed, **result}
 
@@ -579,12 +623,15 @@ def list_call_outcomes(
     prospect_path: str | None = None,
     authorization: str | None = Header(None),
 ):
-    """Outcome options for a contact on this path -- prospecting by default,
-    the maintenance subset for Clients. Served from the registry so the UI
-    never carries its own copy of the list."""
+    """Outcome options for a contact on this path, and the field they land in.
+
+    Prospecting outcomes come from `allo_tag_registry`, maintenance ones from
+    the `direct_call_outcome` field itself. Either way the UI never carries its
+    own copy of a list, and never has to know which field a selection belongs
+    to -- that ships with the options.
+    """
     _check_auth(authorization)
-    return {"prospect_path": prospect_path,
-            "options": call_outcomes.outcome_options(prospect_path)}
+    return {"prospect_path": prospect_path, **call_outcomes.outcome_options(prospect_path)}
 
 @router.post("/tasks/{task_id}/draft-email")
 def draft_task_email(
@@ -621,18 +668,24 @@ def draft_task_email(
         body = body if body is not None else rows[0]["body"]
         contact_record_id = rows[0]["contact_record_id"]
     else:
-        t = requests.get(f"{ATTIO_BASE}/tasks/{task_id}", headers=attio_headers(), timeout=30)
-        t.raise_for_status()
+        try:
+            t = http_client.get(f"{ATTIO_BASE}/tasks/{task_id}", headers=attio_headers())
+            t.raise_for_status()
+        except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+            raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
         linked = t.json()["data"].get("linked_records") or []
         if not linked:
             raise HTTPException(status_code=400, detail="Task has no linked person record")
         contact_record_id = linked[0].get("target_record_id")
 
-    p = requests.get(
-        f"{ATTIO_BASE}/objects/people/records/{contact_record_id}",
-        headers=attio_headers(), timeout=30,
-    )
-    p.raise_for_status()
+    try:
+        p = http_client.get(
+            f"{ATTIO_BASE}/objects/people/records/{contact_record_id}",
+            headers=attio_headers(),
+        )
+        p.raise_for_status()
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
     emails = p.json()["data"]["values"].get("email_addresses") or []
     if not emails:
         raise HTTPException(status_code=400, detail="Linked contact has no email address")
@@ -643,38 +696,63 @@ def draft_task_email(
 
 
 @router.patch("/tasks/{task_id}/complete")
-def complete_task(task_id: str, authorization: str | None = Header(None)):
+def complete_task(
+    task_id: str,
+    record_id: str | None = None,
+    note: str | None = None,
+    authorization: str | None = Header(None),
+):
+    """Complete a task, and write the rep's note to the linked record first.
+
+    The note is what a follow-up task's card actually produces -- there is no
+    outcome field on that path -- so dropping it would make the field on screen
+    decorative. It is written before the completion for the same reason
+    log-call-outcome applies its outcome first: a note that failed to land
+    should not be buried under a closed task.
+
+    A note with no linked record has nowhere to go; that is reported rather
+    than silently discarded.
+    """
     _check_auth(authorization)
-    resp = requests.patch(
-        f"{ATTIO_BASE}/tasks/{task_id}",
-        headers=attio_headers(),
-        json={"data": {"is_completed": True}},
-        timeout=30,
-    )
+
+    note_id = None
+    note_error = None
+    if note and note.strip():
+        if record_id:
+            note_id = call_outcomes.create_note(
+                record_id, "Task note", note.strip(), source="task-runner")
+            if note_id is None:
+                note_error = "Attio rejected the note; see the hub log."
+        else:
+            note_error = "Task has no linked person record, so the note had nowhere to go."
+        if note_error:
+            return {"ok": False, "task_id": task_id, "is_completed": False,
+                    "note_id": None, "status": "note_failed", "detail": note_error}
+
+    try:
+        resp = http_client.patch(
+            f"{ATTIO_BASE}/tasks/{task_id}",
+            headers=attio_headers(),
+            json={"data": {"is_completed": True}},
+        )
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
     if resp.status_code >= 400:
         raise HTTPException(status_code=resp.status_code, detail=resp.text[:500])
-    return {"ok": True, "task_id": task_id, "is_completed": True}
+    return {"ok": True, "task_id": task_id, "is_completed": True, "note_id": note_id}
 
 
 # ---------------------------------------------------------------------------
 # Status (read-only)
 # ---------------------------------------------------------------------------
 
-@router.get("/status/smartlead")
-def status_smartlead(authorization: str | None = Header(None)):
-    _check_auth(authorization)
-    if not SMARTLEAD_API_KEY or not SMARTLEAD_CAMPAIGN_ID:
-        raise HTTPException(
-            status_code=503,
-            detail="SMARTLEAD_API_KEY / SMARTLEAD_CAMPAIGN_ID not configured on this service",
-        )
-
+def _build_smartlead_status():
     out = {"campaign_id": SMARTLEAD_CAMPAIGN_ID}
 
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{SMARTLEAD_BASE}/campaigns/{SMARTLEAD_CAMPAIGN_ID}",
-            params={"api_key": SMARTLEAD_API_KEY}, timeout=20,
+            params={"api_key": SMARTLEAD_API_KEY},
         )
         r.raise_for_status()
         c = r.json()
@@ -685,9 +763,9 @@ def status_smartlead(authorization: str | None = Header(None)):
         out["campaign_error"] = str(e)
 
     try:
-        r = requests.get(
+        r = http_client.get(
             f"{SMARTLEAD_BASE}/campaigns/{SMARTLEAD_CAMPAIGN_ID}/leads",
-            params={"api_key": SMARTLEAD_API_KEY, "offset": 0, "limit": 1}, timeout=20,
+            params={"api_key": SMARTLEAD_API_KEY, "offset": 0, "limit": 1},
         )
         r.raise_for_status()
         out["total_leads"] = r.json().get("total_leads")
@@ -720,6 +798,17 @@ def status_smartlead(authorization: str | None = Header(None)):
         con.close()
 
     return out
+
+
+@router.get("/status/smartlead")
+def status_smartlead(authorization: str | None = Header(None)):
+    _check_auth(authorization)
+    if not SMARTLEAD_API_KEY or not SMARTLEAD_CAMPAIGN_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="SMARTLEAD_API_KEY / SMARTLEAD_CAMPAIGN_ID not configured on this service",
+        )
+    return _cached_status("smartlead", _build_smartlead_status)
 
 
 @router.get("/status/anthropic")
@@ -784,22 +873,16 @@ def status_anthropic(authorization: str | None = Header(None)):
     return result
 
 
-@router.get("/status/snitcher-review")
-def status_snitcher_review(authorization: str | None = Header(None)):
-    """Count of Snitcher Review entries still sitting at Status = New.
-    Note the list's parent object is companies, not people."""
-    _check_auth(authorization)
-
+def _build_snitcher_review_status():
     new_count = 0
     total = 0
     offset = 0
     limit = 500
     while True:
-        resp = requests.post(
+        resp = http_client.post(
             f"{ATTIO_BASE}/lists/{SNITCHER_REVIEW_LIST_ID}/entries/query",
             headers=attio_headers(),
             json={"limit": limit, "offset": offset},
-            timeout=30,
         )
         resp.raise_for_status()
         page = resp.json().get("data", [])
@@ -821,6 +904,17 @@ def status_snitcher_review(authorization: str | None = Header(None)):
         "status_new": new_count,
         "total_entries": total,
     }
+
+
+@router.get("/status/snitcher-review")
+def status_snitcher_review(authorization: str | None = Header(None)):
+    """Count of Snitcher Review entries still sitting at Status = New.
+    Note the list's parent object is companies, not people."""
+    _check_auth(authorization)
+    try:
+        return _cached_status("snitcher-review", _build_snitcher_review_status)
+    except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
+        raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
 
 
 @router.get("/status/ac-bridge")
