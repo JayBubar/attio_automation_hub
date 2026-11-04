@@ -20,6 +20,7 @@ from form_fill_routes import router as form_fill_router
 from ops_center_routes import router as ops_center_router
 from campaign_routes import router as campaign_router
 from graph_mail import router as graph_mail_router
+import ac_engagement_routes
 
 app = FastAPI(title="Attio Automation Hub")
 
@@ -29,6 +30,20 @@ app.include_router(form_fill_router)
 app.include_router(ops_center_router)
 app.include_router(campaign_router)
 app.include_router(graph_mail_router)
+app.include_router(ac_engagement_routes.router)
+
+
+# The AC engagement receiver buffers events in memory and judges them in a
+# background sweep (see ac_engagement_routes.py). Flush on shutdown so a
+# redeploy does not drop the last few seconds of clicks.
+@app.on_event("startup")
+def _start_ac_engagement():
+    ac_engagement_routes.start_worker()
+
+
+@app.on_event("shutdown")
+def _stop_ac_engagement():
+    ac_engagement_routes.stop_worker()
 
 
 @app.get("/")

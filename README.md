@@ -17,6 +17,9 @@ automation_server/             <- Railway Root Directory points HERE
   automation_config.py         Runtime on/off flags (MotherDuck -> env -> default)
   smartlead_routes.py          /webhooks/smartlead
   activecampaign_routes.py     /webhooks/activecampaign
+  ac_engagement_routes.py      /webhooks/ac/engagement (clicks, guide downloads)
+  ac_engagement_rules.py       scanner filter + classification (pure, tested)
+  tests/                       pytest -q tests
   form_fill_routes.py          /webhooks/ac-form-fill
   ops_center_routes.py         /trigger/*, /status/*, /tasks/* for the Ops Center
   graph_mail.py                /auth/microsoft/*, Outlook draft creation
@@ -171,6 +174,50 @@ There is **no `ac_contact_id` attribute on People** in the workspace. Writing it
 rotation script only writes it when `ATTIO_AC_CONTACT_ID_SLUG` is set — and it
 should stay empty until the attribute exists. Until then eviction looks the AC
 contact up by email instead, which costs one extra AC call per evicted contact.
+
+## AC clicks and guide downloads → Attio (`/webhooks/ac/engagement`)
+
+People who click an AC email or download the guide get an Attio note and a
+follow-up task for their Contact Owner. Details in the docstrings of
+`ac_engagement_routes.py` (flow) and `ac_engagement_rules.py` (filter).
+
+- **Source:** AC native webhooks for `click` and `contact_tag_added`, pointed at
+  `https://<hub>/webhooks/ac/engagement?token=<AC_WEBHOOK_TOKEN>`. The route
+  fails closed: no token configured means 503, a wrong token 401.
+- **Scanner filter:** mail-security gateways click every link. Events are
+  judged in a sweep about 5 minutes after they arrive, so a burst is seen
+  whole. Rules: `multi_link`, `repeat_link`, `domain_burst`, `early_click`
+  (only with `ACTIVECAMPAIGN_API_URL`/`_KEY` set), `tag_bulk`. Every dropped
+  event keeps its rule in `ac_engagement_events.reason` for tuning.
+- **Download vs AC Activity:** the `Guide Download` tag, or a click on a link
+  containing `plug-the-leaks-guide` (`AC_GUIDE_TAGS`, `AC_GUIDE_LINK_PATTERNS`).
+- **Attio:** first event for a person + kind → note "AC Download — <campaign>"
+  and a task with the same prefix, assigned to Contact Owner (Jay if blank or
+  not a workspace member, e.g. Edna Stone), due 5pm CT next business day. More
+  events while that task is open → lines appended to the note, no new task.
+  Once the task is completed, the next event opens a new note and task.
+  `last_activity_date` moves forward either way.
+- **Exceptions:** no Attio person by email or by AC's Attio Record ID (field 8)
+  → `status = 'exception'`, shown in the 990 tool, never silently dropped.
+- **Tables** (MotherDuck, `MOTHERDUCK_DATABASE`): `ac_engagement_events` (one
+  row per event with its verdict) and `ac_engagement_threads` (person + kind →
+  current note and task).
+
+### Turning it on
+
+1. Set `AC_WEBHOOK_TOKEN` (shared with the form-fill route) and deploy.
+   `AC_ENGAGEMENT_ENABLED` stays `false`: events are stored, nothing is written
+   to Attio.
+2. Register the two AC webhooks (events `click`, `contact_tag_added`; sources
+   public, system, admin, api).
+3. After real traffic, preview:
+   `POST /ac-engagement/sweep?dry_run=true` with the Ops Center bearer token.
+4. Set `AC_ENGAGEMENT_ENABLED=true`. The worker sweeps every
+   `AC_ENGAGEMENT_SWEEP_SECONDS` (600); events stored while it was off are
+   processed on the first sweep.
+
+`GET /status/ac-engagement` reports the last event, the last sweep and counts
+by status for the past 7 days.
 
 ## AC form fills → Attio (`/webhooks/ac-form-fill`)
 
