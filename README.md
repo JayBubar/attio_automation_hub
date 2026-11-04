@@ -182,7 +182,7 @@ follow-up task for their Contact Owner. Details in the docstrings of
 `ac_engagement_routes.py` (flow) and `ac_engagement_rules.py` (filter).
 
 - **Source:** AC native webhooks for `click` and `contact_tag_added`, pointed at
-  `https://<hub>/webhooks/ac/engagement?token=<AC_WEBHOOK_TOKEN>`. The route
+  `https://<hub>/webhooks/ac/engagement?token=<AC_ENGAGEMENT_TOKEN>`. The route
   fails closed: no token configured means 503, a wrong token 401.
 - **Scanner filter:** mail-security gateways click every link. Events are
   judged in a sweep about 5 minutes after they arrive, so a burst is seen
@@ -205,7 +205,7 @@ follow-up task for their Contact Owner. Details in the docstrings of
 
 ### Turning it on
 
-1. Set `AC_WEBHOOK_TOKEN` (shared with the form-fill route) and deploy.
+1. Set `AC_ENGAGEMENT_TOKEN` (separate from the form-fill route's token) and deploy.
    `AC_ENGAGEMENT_ENABLED` stays `false`: events are stored, nothing is written
    to Attio.
 2. Register the two AC webhooks (events `click`, `contact_tag_added`; sources

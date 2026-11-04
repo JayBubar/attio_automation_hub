@@ -93,7 +93,9 @@ def _env_list(name, default):
     return tuple(p.strip() for p in raw.split(",") if p.strip())
 
 
-AC_WEBHOOK_TOKEN = os.environ.get("AC_WEBHOOK_TOKEN", "")
+# Its own token, not the form-fill route's AC_WEBHOOK_TOKEN: those five AC automations
+# post without one today, and setting a shared token would lock them out.
+AC_ENGAGEMENT_TOKEN = os.environ.get("AC_ENGAGEMENT_TOKEN", "")
 ENABLED = _env_bool("AC_ENGAGEMENT_ENABLED", False)
 SWEEP_SECONDS = int(os.environ.get("AC_ENGAGEMENT_SWEEP_SECONDS", "600"))
 HOLD_SECONDS = int(os.environ.get("AC_ENGAGEMENT_HOLD_SECONDS", "300"))
@@ -229,9 +231,9 @@ def flush_buffer() -> int:
 def _check_token(token: str | None):
     # Fail closed: AC native webhooks are unsigned, and this route ends in
     # Attio tasks. Without a token anyone who learns the URL could create them.
-    if not AC_WEBHOOK_TOKEN:
-        raise HTTPException(status_code=503, detail="AC_WEBHOOK_TOKEN not configured")
-    if not token or not secrets.compare_digest(token, AC_WEBHOOK_TOKEN):
+    if not AC_ENGAGEMENT_TOKEN:
+        raise HTTPException(status_code=503, detail="AC_ENGAGEMENT_TOKEN not configured")
+    if not token or not secrets.compare_digest(token, AC_ENGAGEMENT_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -657,7 +659,7 @@ def status_ac_engagement(authorization: str | None = Header(None)):
     with _buffer_lock:
         buffered = len(_buffer)
     out = {"service": "attio-automation-hub", "webhook_path": WEBHOOK_PATH,
-           "enabled": ENABLED, "token_configured": bool(AC_WEBHOOK_TOKEN),
+           "enabled": ENABLED, "token_configured": bool(AC_ENGAGEMENT_TOKEN),
            "sweep_seconds": SWEEP_SECONDS, "hold_seconds": HOLD_SECONDS,
            "buffered": buffered, "last_sweep": dict(_last_sweep) or None}
     try:
