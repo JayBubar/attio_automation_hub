@@ -47,7 +47,7 @@ Auth
 ----
 Set AC_WEBHOOK_TOKEN on this service and append &token=<value> to each of the
 five webhook URLs. If the variable is unset the route serves unauthenticated
--- the same posture /webhooks/activecampaign has today -- but this one writes
+-- but this one writes
 to MotherDuck and mutates Attio on every call, so it is worth setting.
 """
 
@@ -62,7 +62,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 
 import http_client
-from activecampaign_routes import attio_find_person_by_email, attio_headers
+from attio_people import attio_find_person_by_email, attio_headers
 
 router = APIRouter()
 

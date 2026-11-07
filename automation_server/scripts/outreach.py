@@ -421,7 +421,7 @@ def ensure_drafts_table(con):
 
 
 def update_prospect_path(session, record_id, new_status):
-    """Value shape matches what smartlead_routes.py / activecampaign_routes.py
+    """Value shape matches what smartlead_routes.py
     already send in production -- a list of {"value": ...}, not a bare string.
     Raises rather than returning False: silently failing to move someone to
     "In Outreach" leaves them in the Never Contacted pool with live tasks
