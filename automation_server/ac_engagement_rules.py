@@ -98,7 +98,7 @@ def parse_ac_time(raw, fallback: datetime) -> datetime:
 
 
 def bare_record_id(raw) -> str:
-    """`person:<uuid>` -> `<uuid>` (see activecampaign_routes.bare_record_id)."""
+    """`person:<uuid>` -> `<uuid>` (AC stores the reference form)."""
     return (raw or "").strip().split(":", 1)[-1].strip()
 
 

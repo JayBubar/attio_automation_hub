@@ -33,7 +33,6 @@ import duckdb
 import http_client
 import ipv4_only
 import requests
-import webhook_log
 from fastapi import APIRouter, Header, HTTPException
 
 router = APIRouter()
@@ -83,11 +82,6 @@ MOTHERDUCK_DB = os.environ.get("MOTHERDUCK_DATABASE", "hubspot_email_archive")
 SMARTLEAD_API_KEY = os.environ.get("SMARTLEAD_API_KEY", "")
 SMARTLEAD_CAMPAIGN_ID = os.environ.get("SMARTLEAD_CAMPAIGN_ID", "")
 SMARTLEAD_BASE = "https://server.smartlead.ai/api/v1"
-
-# The AC bridge's receiver, as mounted by activecampaign_routes.py. Kept here
-# as a constant so /status/ac-bridge checks the path that is actually served
-# rather than a second copy of the string that can drift out of sync.
-AC_WEBHOOK_PATH = "/webhooks/activecampaign"
 
 # Attio web app base for deep links. Workspace slug confirmed via whoami
 # (workspace_name "RaiseTell"); override if the URL slug ever differs.
@@ -915,63 +909,6 @@ def status_snitcher_review(authorization: str | None = Header(None)):
         return _cached_status("snitcher-review", _build_snitcher_review_status)
     except http_client.VENDOR_UNAVAILABLE_EXCEPTIONS as e:
         raise HTTPException(status_code=503, detail=f"Attio temporarily unreachable: {e}")
-
-
-@router.get("/status/ac-bridge")
-def status_ac_bridge(authorization: str | None = Header(None)):
-    """Real state of the AC <-> Attio tag sync.
-
-    Replaces the Ops Center's hardcoded "Down", which probed
-    peaceful-generosity-production-312b.up.railway.app -- a host that 404s and
-    that the bridge never ran on. The bridge is a route in *this* service, so
-    it was reporting Down while working fine.
-
-    Two independent facts, deliberately not collapsed into one green light:
-
-    `route_registered` -- is the receiver actually mounted? Answered by asking
-    this app's own router, not by an HTTP call to ourselves. A route dropped
-    from main.py shows up here as False while /health still says 200.
-
-    `events` -- has any traffic arrived, and when? This is the part a
-    reachability check cannot answer: a correctly mounted route with a
-    misconfigured AC automation pointed at it looks perfectly healthy.
-
-    Note what this deliberately does *not* claim. Quiet is not the same as
-    broken -- no events just means nobody's tag changed, which is the normal
-    state most days. The caller gets the timestamp and decides; this endpoint
-    does not invent an up/down verdict out of silence.
-    """
-    _check_auth(authorization)
-
-    # Local import: main.py imports this module, so this cannot happen at
-    # module scope. `main` is already in sys.modules by the time any request
-    # is served, so this is a dict lookup, not a re-import.
-    #
-    # Falls back to activecampaign_routes' own router if `main` isn't
-    # importable under some entrypoint. A slightly weaker answer beats a 500 --
-    # this endpoint exists to report status, so it has no business being the
-    # thing that breaks.
-    try:
-        from main import app as _app
-        routes, scope = _app.routes, "app"
-    except Exception as e:
-        import activecampaign_routes
-        routes, scope = activecampaign_routes.router.routes, f"router-only ({e})"
-
-    registered = any(
-        getattr(r, "path", None) == AC_WEBHOOK_PATH
-        and "POST" in (getattr(r, "methods", None) or set())
-        for r in routes
-    )
-
-    return {
-        "service": "attio-automation-hub",
-        "webhook_path": AC_WEBHOOK_PATH,
-        "route_registered": registered,
-        "checked_against": scope,
-        "expected_series_id": os.environ.get("ACTIVECAMPAIGN_SERIES_ID", "15"),
-        "events": webhook_log.recent_summary("activecampaign"),
-    }
 
 
 # ---------------------------------------------------------------------------

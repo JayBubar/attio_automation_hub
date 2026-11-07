@@ -67,7 +67,7 @@ from fastapi.concurrency import run_in_threadpool
 
 import ac_engagement_rules as rules
 import http_client
-from activecampaign_routes import attio_find_person_by_email, attio_headers
+from attio_people import attio_find_person_by_email, attio_headers
 from ops_center_routes import REP_MEMBER_IDS, _check_auth
 
 router = APIRouter()

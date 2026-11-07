@@ -2,7 +2,7 @@
 main.py
 
 Attio Automation Hub -- single FastAPI service for all webhook receivers
-(Smartlead, ActiveCampaign, and later Allo/others) plus a place for the
+(Smartlead, ActiveCampaign engagement and form fills, and later Allo/others) plus a place for the
 eventual automations UI to talk to. One service, one domain, one set of
 logs, instead of a separate Railway shell per integration.
 
@@ -15,7 +15,6 @@ import ipv4_only  # noqa: F401  -- must be first; see module docstring
 from fastapi import FastAPI
 
 from smartlead_routes import router as smartlead_router
-from activecampaign_routes import router as activecampaign_router
 from form_fill_routes import router as form_fill_router
 from ops_center_routes import router as ops_center_router
 from campaign_routes import router as campaign_router
@@ -25,7 +24,6 @@ import ac_engagement_routes
 app = FastAPI(title="Attio Automation Hub")
 
 app.include_router(smartlead_router)
-app.include_router(activecampaign_router)
 app.include_router(form_fill_router)
 app.include_router(ops_center_router)
 app.include_router(campaign_router)

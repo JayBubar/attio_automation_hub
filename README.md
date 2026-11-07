@@ -16,7 +16,7 @@ automation_server/             <- Railway Root Directory points HERE
   main.py                      FastAPI app, wires up all routers
   automation_config.py         Runtime on/off flags (MotherDuck -> env -> default)
   smartlead_routes.py          /webhooks/smartlead
-  activecampaign_routes.py     /webhooks/activecampaign
+  attio_people.py              Attio People lookups shared by the AC webhooks
   ac_engagement_routes.py      /webhooks/ac/engagement (clicks, guide downloads)
   ac_engagement_rules.py       scanner filter + classification (pure, tested)
   tests/                       pytest -q tests
@@ -60,81 +60,12 @@ tab first -- the app won't start without `ATTIO_API_KEY`.
 4. Document the route's trigger/endpoint in the team's Webhooks & API Calls
    tracker tab.
 
-## AC tag ↔ Attio list sync (`/webhooks/activecampaign`)
+## ActiveCampaign and Attio
 
-Keeps Attio's **Active Marketing Contact** flag, **Prospect Path**, and
-membership of the list **Current Marketing Prospects in ActiveCampaign**
-(`active_campaign_target_list`) in step with AC's **Attio Marketing Contact**
-tag (tag id 3).
-
-**Automation 15 is designed to carry both triggers** — tag added and tag
-removed — pointed at the same URL, so `seriesid` is 15 either way and cannot
-tell them apart. The route reads `contact[tags]` instead, which lists only
-currently-applied tags: marketing tag present means added, absent means
-removed. `seriesid` is still checked, as a gate — a payload from any other
-automation is logged and ignored rather than acted on.
-
-> ⚠️ **Open manual prerequisite (as of 2026-08-12): the Tag Removed trigger
-> does not exist yet.** `GET /api/3/automations/15` reports a single start:
-> `{"id":"24","series":"15","type":"tagadd"}`. There is no `tagremove`. The
-> receiver handles removals correctly, but AC never sends one — so removing
-> the tag in AC is silently a no-op and the contact stays
-> `active_marketing_contact=true` in Attio forever. Fix in AC's UI: automation
-> 15 → add a second trigger, **Tag Removed**, tag id 3, same webhook URL. This
-> cannot be done over the API; AC exposes no trigger-creation endpoint.
-
-A payload with **no `contact[tags]` key at all** is ignored, not treated as a
-removal. "Contact has no tags" and "tags field was never mapped on the webhook
-action" are indistinguishable otherwise, and guessing wrong un-flags people who
-are still in outreach. Every event returning `no_tags_field` means the field is
-not mapped in AC.
-
-**Lookup is by `contact[fields][attio_record_id]` first**, email second. The id
-survives a contact changing their email address; a stale id (record deleted or
-merged) falls back to email rather than failing.
-
-AC stores that field in Attio's record-reference form — `person:<uuid>`. The
-`person:` prefix belongs to the reference notation, not to the id, and Attio's
-API wants the bare UUID in URL paths and `parent_record_id` bodies alike.
-Unstripped it produced `400 Bad Request` on the first lookup of every event, and
-because `raise_for_status()` sat below the 404 check the 400 escaped as an
-unhandled error and 500'd the webhook. `bare_record_id()` now strips it once,
-where the field is read, so all four downstream uses get a clean id; and any
-4xx from the existence check falls back to email instead of raising — a
-malformed id is a reason to try the other lookup, not to fail the sync.
-
-| AC state | Attio writes |
-| --- | --- |
-| tag present | `active_marketing_contact=true`, path `In Outreach`, date today, + list add |
-| tag absent | `active_marketing_contact=false`, path `Cold/Retry Pending`, date today |
-
-List *removal* stays with the Attio-native workflow (Active Marketing Contact =
-false → remove from list); only the add is done here.
-
-### Is the bridge alive? (`/status/ac-bridge`)
-
-Every inbound AC webhook is appended to `webhook_event_log` in MotherDuck
-(`webhook_log.py`) — **including the ignored ones**, which are the diagnostic:
-a run of `no_tags_field` means the tags field isn't mapped on the AC webhook
-action, and a run of `unexpected_seriesid` means another automation is pointed
-here. Log only successes and both look identical to silence.
-
-Logging is best-effort and never fails the webhook. A MotherDuck outage must
-not make the hub 500 back at AC, which would trigger AC's retry-then-disable
-behaviour and turn a reporting problem into a real outage.
-
-`GET /status/ac-bridge` returns two facts, deliberately not merged into one
-light:
-
-- `route_registered` — is the receiver mounted? Read from the app's own router,
-  so a route dropped from `main.py` shows False while `/health` still says 200.
-- `events` — last event, 7-day count, and a recent tail. A mounted route with a
-  mis-wired AC automation looks perfectly healthy without this.
-
-**Quiet is not broken.** No events just means nobody's tag changed. The
-endpoint reports the timestamp and lets the caller judge; it does not
-manufacture an up/down verdict out of silence. If the log can't be read it
-returns `available: false` with a reason, rather than reporting "no traffic".
+Attio decides who belongs in AC, not the other way round. The old `/webhooks/activecampaign`
+bridge, which set Attio's Active Marketing Contact and Prospect Path from AC's **Attio
+Marketing Contact** tag, was retired on 2026-11-06. The 990 tool's AC marketing sync job now
+reads the Attio checkbox each night and tags AC contacts for removal.
 
 ### Pausing and resuming the daily rotation
 
@@ -283,8 +214,7 @@ typed columns on purpose — Social and Conference follow-ups are meant to
 land in this same table under a different `source`, carrying whatever they
 need in there instead of a migration.
 
-**`AC_WEBHOOK_TOKEN`** is optional. Unset, the route serves unauthenticated,
-matching `/webhooks/activecampaign`. Set it and append `&token=` to all five
+**`AC_WEBHOOK_TOKEN`** is optional. Unset, the route serves unauthenticated. Set it and append `&token=` to all five
 URLs — this endpoint writes to MotherDuck and mutates Attio on every call,
 so it's worth having.
 
@@ -302,7 +232,6 @@ serving if that variable is unset -- an empty token must never be a valid one.
 | `PATCH /tasks/{task_id}/complete` | Marks the Attio task completed. |
 | `POST /tasks/{task_id}/draft-email?rep=` | Creates an Outlook draft in the rep's own mailbox. |
 | `GET /status/smartlead` | Campaign state + `total_leads` + last rotation run. Note `total_leads` is lifetime, not active — see below. |
-| `GET /status/ac-bridge` | AC↔Attio bridge: receiver mounted, last webhook event, recent tail. |
 | `GET /campaigns` | All campaigns, shaped for a selector. |
 | `GET /campaigns/{record_id}/detail?basis=` | Targets, funnel, activity feed, linked deals, ROI. |
 | `GET /status/snitcher-review` | Snitcher Review entries at Status = New. |
