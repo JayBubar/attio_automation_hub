@@ -120,6 +120,10 @@ CONTEXT_WORKERS = 10
 # calls is the unbounded page load the cap existed to prevent.
 TASK_PAGE_SIZE = 500
 
+# (connect, read) for one page of the task list. Longer read than the shared
+# default: a full page is a big response, and a timeout fails the whole queue.
+TASK_LIST_TIMEOUT = (3, 20)
+
 
 def _check_auth(authorization: str | None):
     if not OPS_CENTER_TOKEN:
@@ -289,8 +293,13 @@ def get_rep_tasks(
             resp = http_client.get(
                 f"{ATTIO_BASE}/tasks",
                 headers=attio_headers(),
+                # Ask Attio for this rep's tasks only. Pulling every open task
+                # in the workspace and filtering here made each 500-row page
+                # slow enough to hit the read timeout (2026-11-17, /tasks/kevin
+                # 503 after ~10s). assigned_to_rep below stays as a guard.
                 params={"limit": TASK_PAGE_SIZE, "offset": offset, "is_completed": "false",
-                        "sort": "created_at:asc"},
+                        "sort": "created_at:asc", "assignee": member_id},
+                timeout=TASK_LIST_TIMEOUT,
             )
             resp.raise_for_status()
             page = resp.json().get("data", [])
