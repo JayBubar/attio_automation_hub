@@ -97,6 +97,7 @@ REP_MEMBER_IDS = {
     "kurt": "928e9d43-504b-4e51-8db2-54c4c40d0ecf",  # Kurt Haas
     "jay": "acc65c82-459c-46a7-bd87-da84d6c4fcd5",   # Jay Bubar
     "joel": "ca4b7dfe-0f51-4631-89df-8b2d8583cd8d",  # Joel Weinbach
+    "kevin": "d9bc01a6-73e6-4fec-b70d-ff6644a332d3",  # Kevin Hoyle
 }
 
 # scripts/ sits next to this file inside the deployed root directory
@@ -132,7 +133,7 @@ def _check_auth(authorization: str | None):
 
 def _check_rep(rep: str):
     if rep not in REP_MEMBER_IDS:
-        raise HTTPException(status_code=400, detail="rep must be kurt, jay, or joel")
+        raise HTTPException(status_code=400, detail=f"rep must be one of {', '.join(REP_MEMBER_IDS)}")
 
 
 def attio_headers():
