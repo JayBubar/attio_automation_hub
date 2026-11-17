@@ -114,7 +114,7 @@ OWNER_MEMBER_IDS = {
     "jay bubar": REP_MEMBER_IDS["jay"],
     "kurt haas": REP_MEMBER_IDS["kurt"],
     "joel weinbach": REP_MEMBER_IDS["joel"],
-    "kevin hoyle": "d9bc01a6-73e6-4fec-b70d-ff6644a332d3",
+    "kevin hoyle": REP_MEMBER_IDS["kevin"],
 }
 FALLBACK_ASSIGNEE = os.environ.get("AC_ENGAGEMENT_FALLBACK_ASSIGNEE", REP_MEMBER_IDS["jay"])
 

@@ -113,6 +113,8 @@ REPS = {
             "owner_names": ["Jay Bubar", "Edna Stone"]},  # Edna's contacts redistribute to Jay
     "joel": {"member_id": "ca4b7dfe-0f51-4631-89df-8b2d8583cd8d", "name": "Joel Weinbach",
               "owner_names": ["Joel Weinbach"]},
+    "kevin": {"member_id": "d9bc01a6-73e6-4fec-b70d-ff6644a332d3", "name": "Kevin Hoyle",
+              "owner_names": ["Kevin Hoyle"]},
 }
 
 CLAUDE_MODEL = "claude-sonnet-5"  # change if you'd rather use a different model

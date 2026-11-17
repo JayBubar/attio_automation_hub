@@ -61,7 +61,7 @@ MOTHERDUCK_DB = os.environ.get("MOTHERDUCK_DATABASE", "hubspot_email_archive")
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPES = "offline_access User.Read Mail.ReadWrite"
 
-REPS = ("kurt", "jay", "joel")
+REPS = ("kurt", "jay", "joel", "kevin")
 
 
 def _authority():
@@ -241,7 +241,7 @@ def microsoft_auth_start(rep: str, authorization: str | None = Header(None)):
     if not authorization or not hmac.compare_digest(authorization, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
     if rep not in REPS:
-        raise HTTPException(status_code=400, detail="rep must be kurt, jay, or joel")
+        raise HTTPException(status_code=400, detail=f"rep must be one of {', '.join(REPS)}")
 
     params = {
         "client_id": AZURE_CLIENT_ID,
